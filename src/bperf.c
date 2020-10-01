@@ -6,19 +6,24 @@
  * @brief A kernel module for high frequency counter sampling on x86_64 systems
  */
 
+#include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/types.h>
 
-#define BPERF_NAME    "bperf"
-#define BPERF_LICENSE "GPL"
-#define BPERF_AUTHOR  "Srimanta Barua <srimanta.barua1@gmail.com>"
-#define BPERF_DESC    "Kernel module for high frequency counter sampling on x86_64 systems"
-#define BPERF_VERSION "0.1"
-
+#define BPERF_NAME      "bperf"
+#define BPERF_LICENSE   "GPL"
+#define BPERF_AUTHOR    "Srimanta Barua <srimanta.barua1@gmail.com>"
+#define BPERF_DESC      "Kernel module for high frequency counter sampling on x86_64 systems"
+#define BPERF_VERSION   "0.1"
 #define BPERF_DEV_COUNT 1
+#define BPERF_BLK_SZ    2048
+
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
 
 MODULE_LICENSE(BPERF_LICENSE);
 MODULE_AUTHOR(BPERF_AUTHOR);
@@ -26,16 +31,232 @@ MODULE_DESCRIPTION(BPERF_DESC);
 MODULE_VERSION(BPERF_VERSION);
 
 /**
+ * @brief Linked list node of circular string buffer
+ *
+ * Total size of a node is BPERF_BLK_SZ bytes. This size includes this "header" struct. The data
+ * starts immediately after it.
+ */
+struct bperf_sbuffer_node {
+	size_t           start; /* Start index of unread data in this node */
+	size_t           size;  /* Amount of data stored in this node */
+	struct list_head list;  /* Linked list node */
+	/* Data follows immediately after this */
+};
+
+#define BPERF_SBUFFER_MAX_SZ (BPERF_BLK_SZ - sizeof(struct bperf_sbuffer_node))
+
+/**
+ * @brief Get pointer to dat for node
+ */
+static char* bperf_sbuffer_node_data(struct bperf_sbuffer_node *node)
+{
+	return ((char*) node) + sizeof(struct bperf_sbuffer_node);
+}
+
+/**
+ * @brief Allocate a new empty buffer node
+ */
+static struct bperf_sbuffer_node* bperf_sbuffer_node_new(void)
+{
+	struct bperf_sbuffer_node *ret = kmalloc(BPERF_BLK_SZ, GFP_KERNEL);
+	if (!ret) {
+		printk(KERN_ALERT "bperf: kmalloc failed\n");
+		return NULL;
+	}
+	ret->start = ret->size = 0;
+	INIT_LIST_HEAD(&ret->list);
+	return ret;
+}
+
+/**
+ * @brief Free memory for an allocated buffer node
+ */
+static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node)
+{
+	list_del(&node->list);
+	kfree(node);
+}
+
+/**
+ * @brief Circular buffer to write data to
+ */
+struct bperf_sbuffer {
+	struct list_head list; /* Head node to linked list of buffers */
+};
+
+/**
+ * @brief Initialize buffer
+ */
+static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
+{
+	struct bperf_sbuffer_node *first_node;
+	INIT_LIST_HEAD(&sbuffer->list);
+	if (!(first_node = bperf_sbuffer_node_new())) {
+		return -1;
+	}
+	list_add(&sbuffer->list, &first_node->list);
+	return 0;
+}
+
+/**
+ * @brief Free memory for buffer
+ */
+static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
+{
+	struct list_head *next, *node = sbuffer->list.next;
+	while (node != &sbuffer->list) {
+		next = node->next;
+		bperf_sbuffer_node_free(container_of(node, struct bperf_sbuffer_node, list));
+		node = next;
+	}
+}
+
+/**
+ * @brief Write len bytes of data to the end of the buffer
+ */
+static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, size_t len)
+{
+	struct bperf_sbuffer_node *last_node, *new_node;
+	ssize_t space_left, amt_to_write, ret = 0;
+	if (len == 0) {
+		return 0;
+	}
+
+	while (true) {
+		last_node = container_of(sbuffer->list.prev, struct bperf_sbuffer_node, list);
+		space_left = BPERF_SBUFFER_MAX_SZ - last_node->size;
+		amt_to_write = MIN(len - ret, space_left);
+
+		if (amt_to_write > 0) {
+			memcpy(bperf_sbuffer_node_data(last_node) + last_node->size, src + ret, amt_to_write);
+			ret += amt_to_write;
+			last_node->size += amt_to_write;
+		}
+		if (ret == len) {
+			return ret;
+		}
+
+		if (!(new_node = bperf_sbuffer_node_new())) {
+			return -1;
+		}
+		list_add_tail(&sbuffer->list, &new_node->list);
+	}
+}
+
+/**
+ * @brief Read upto len bytes of data from the buffer into the destination (user-space)
+ */
+static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *dest, size_t len)
+{
+	ssize_t amt_data_in_node, amt_to_write, ret = 0;
+	struct list_head *ll_node = sbuffer->list.next;
+	struct bperf_sbuffer_node *node;
+
+	if (len == 0) {
+		return 0;
+	}
+
+	while (ll_node != &sbuffer->list) {
+		node = container_of(ll_node, struct bperf_sbuffer_node, list);
+		amt_data_in_node = node->size - node->start;
+		amt_to_write = MIN(amt_data_in_node, len - ret);
+
+		if (amt_to_write == 0) {
+			if (node->size == BPERF_SBUFFER_MAX_SZ) {
+				ll_node = ll_node->next;
+				bperf_sbuffer_node_free(node);
+				continue;
+			} else {
+				break;
+			}
+		} else {
+			amt_to_write -= copy_to_user(dest + ret, bperf_sbuffer_node_data(node) + node->start, amt_to_write);
+			if (amt_to_write == 0) {
+				break;
+			}
+			node->start += amt_to_write;
+			ret += amt_to_write;
+		}
+		if (ret == len) {
+			return ret;
+		}
+	}
+
+	return ret;
+}
+
+/**
  * @brief Global module state
  */
-static struct global_state {
-	dev_t         dev;     // Stores the device number
-	struct class  *class;  // The device-driver class struct
-	struct device *device; // The device-driver device struct
-} STATE = {
-	.dev = 0,
-	.class = NULL,
-	.device = NULL,
+static struct bperf_state {
+	dev_t         dev;        /* Stores the device number */
+	struct class  *class;     /* The device-driver class struct */
+	struct device *device;    /* The device-driver device struct */
+	struct cdev   cdev;       /* Char device structure */
+	size_t        open_count; /* Current open count for device file */
+} STATE = { 0 };
+
+/**
+ * @brief Dummy llseek function. Basically we don't support seeking
+ */
+static loff_t bperf_llseek(struct file *filp, loff_t off, int whence)
+{
+	return -ESPIPE; /* unseekable */
+}
+
+/**
+ * @brief Open the device and maintain a count of how many times it has been opened
+ */
+static int bperf_open(struct inode *inode, struct file *filp)
+{
+	struct bperf_state *state = container_of(inode->i_cdev, struct bperf_state, cdev);
+	state->open_count++;
+	filp->private_data = state;
+	printk(KERN_INFO "bperf: Device file opened\n");
+	return 0;
+}
+
+/**
+ * @brief Decrement count of number of instances of the file being opened
+ */
+static int bperf_release(struct inode *inode, struct file *filp)
+{
+	struct bperf_state *state = container_of(inode->i_cdev, struct bperf_state, cdev);
+	state->open_count--;
+	printk(KERN_INFO "bperf: Device file closed\n");
+	return 0;
+}
+
+/**
+ * @brief Read the file
+ */
+static ssize_t bperf_read(struct file *filp, char __user *buffer, size_t size, loff_t *f_pos)
+{
+	struct bperf_state *state = filp->private_data;
+	static const char *msg = "Hello world!\n"; 
+	size_t n, to_copy, len = strlen(msg);
+
+	printk(KERN_INFO "bperf: Device file read: %llu\n", *f_pos);
+
+	if (*f_pos >= len) {
+		return 0;
+	}
+
+	to_copy = MIN(len + 1 - *f_pos, size);
+	n = copy_to_user(buffer, msg + *f_pos, to_copy);
+	*f_pos += to_copy - n;
+	return to_copy - n;
+}
+
+/**
+ * @brief File operations for /dev/bperf files
+ */
+static struct file_operations bperf_fops = {
+	.owner   = THIS_MODULE,
+	.llseek  = bperf_llseek,
+	.open    = bperf_open,
+	.release = bperf_release,
+	.read    = bperf_read,
 };
 
 /**
@@ -62,23 +283,32 @@ static int __init bperf_init(void)
 	}
 
 	// Create device
-	if (IS_ERR(STATE.device = device_create(STATE.class, NULL, STATE.dev, NULL, "bperf%d", MINOR(STATE.dev)))) {
+	if (IS_ERR(STATE.device = device_create(STATE.class, NULL, STATE.dev, NULL, "bperf"))) {
 		printk(KERN_ALERT "bperf: Failed to create device file\n");
 		ret = PTR_ERR(STATE.device);
 		goto error_device;
 	}
 
-	goto success;
+	// Initialize char device structure
+	cdev_init(&STATE.cdev, &bperf_fops);
+	STATE.cdev.owner = THIS_MODULE;
+	STATE.cdev.ops = &bperf_fops;
+	if ((ret = cdev_add(&STATE.cdev, STATE.dev, 1))) {
+		printk(KERN_ALERT "bperf: Failed to add char device\n");
+		goto error_cdev;
+	}
 
+	// Success
+	printk(KERN_INFO "bperf: Loaded!\n");
+	return 0;
+
+error_cdev:
+	device_destroy(STATE.class, STATE.dev);
 error_device:
 	class_destroy(STATE.class);
 error_class:
 	unregister_chrdev_region(STATE.dev, BPERF_DEV_COUNT);
 	return ret;
-
-success:
-	printk(KERN_INFO "bperf: Loaded!\n");
-	return 0;
 }
 
 /**
@@ -88,6 +318,7 @@ static void __exit bperf_exit(void)
 {
 	printk(KERN_INFO "bperf: Unloading...\n");
 
+	cdev_del(&STATE.cdev);
 	device_destroy(STATE.class, STATE.dev);
 	class_destroy(STATE.class);
 	unregister_chrdev_region(STATE.dev, BPERF_DEV_COUNT);
