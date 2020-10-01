@@ -21,7 +21,7 @@
 #define BPERF_DESC      "Kernel module for high frequency counter sampling on x86_64 systems"
 #define BPERF_VERSION   "0.1"
 #define BPERF_DEV_COUNT 1
-#define BPERF_BLK_SZ    2048
+#define BPERF_BLK_SZ    64
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
@@ -92,9 +92,9 @@ static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
 	struct bperf_sbuffer_node *first_node;
 	INIT_LIST_HEAD(&sbuffer->list);
 	if (!(first_node = bperf_sbuffer_node_new())) {
-		return -1;
+		return -ENOMEM;
 	}
-	list_add(&sbuffer->list, &first_node->list);
+	list_add(&first_node->list, &sbuffer->list);
 	return 0;
 }
 
@@ -137,9 +137,9 @@ static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, siz
 		}
 
 		if (!(new_node = bperf_sbuffer_node_new())) {
-			return -1;
+			return -ENOMEM;
 		}
-		list_add_tail(&sbuffer->list, &new_node->list);
+		list_add_tail(&new_node->list, &sbuffer->list);
 	}
 }
 
@@ -189,11 +189,12 @@ static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *de
  * @brief Global module state
  */
 static struct bperf_state {
-	dev_t         dev;        /* Stores the device number */
-	struct class  *class;     /* The device-driver class struct */
-	struct device *device;    /* The device-driver device struct */
-	struct cdev   cdev;       /* Char device structure */
-	size_t        open_count; /* Current open count for device file */
+	dev_t                dev;        /* Stores the device number */
+	struct class         *class;     /* The device-driver class struct */
+	struct device        *device;    /* The device-driver device struct */
+	struct cdev          cdev;       /* Char device structure */
+	size_t               open_count; /* Current open count for device file */
+	struct bperf_sbuffer sbuffer;    /* Buffer of string data */
 } STATE = { 0 };
 
 /**
@@ -233,19 +234,11 @@ static int bperf_release(struct inode *inode, struct file *filp)
 static ssize_t bperf_read(struct file *filp, char __user *buffer, size_t size, loff_t *f_pos)
 {
 	struct bperf_state *state = filp->private_data;
-	static const char *msg = "Hello world!\n"; 
-	size_t n, to_copy, len = strlen(msg);
-
-	printk(KERN_INFO "bperf: Device file read: %llu\n", *f_pos);
-
-	if (*f_pos >= len) {
-		return 0;
+	ssize_t ret = bperf_sbuffer_read(&state->sbuffer, buffer, size);
+	if (ret > 0) {
+		*f_pos += ret;
 	}
-
-	to_copy = MIN(len + 1 - *f_pos, size);
-	n = copy_to_user(buffer, msg + *f_pos, to_copy);
-	*f_pos += to_copy - n;
-	return to_copy - n;
+	return ret;
 }
 
 /**
@@ -267,6 +260,21 @@ static int __init bperf_init(void)
 	int ret;
 
 	printk(KERN_INFO "bperf: Loading...\n");
+
+	// Allocate memory for string buffer
+	if ((ret = bperf_sbuffer_init(&STATE.sbuffer)) < 0) {
+		printk(KERN_ALERT "bperf: Failed to allocate string buffer\n");
+		return ret;
+	}
+	bperf_sbuffer_write(&STATE.sbuffer, "aaaaaaaa", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "bbbbbbbb", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "cccccccc", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "dddddddd", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "aaaaaaaa", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "bbbbbbbb", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "cccccccc", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "dddddddd", 8);
+	bperf_sbuffer_write(&STATE.sbuffer, "\n\0", 2);
 
 	// Try to dynamically allocate a major number for the device
 	if ((ret = alloc_chrdev_region(&STATE.dev, 0, BPERF_DEV_COUNT, BPERF_NAME)) < 0) {
@@ -322,6 +330,7 @@ static void __exit bperf_exit(void)
 	device_destroy(STATE.class, STATE.dev);
 	class_destroy(STATE.class);
 	unregister_chrdev_region(STATE.dev, BPERF_DEV_COUNT);
+	bperf_sbuffer_fini(&STATE.sbuffer);
 
 	printk(KERN_INFO "bperf: Unloaded!\n");
 }
