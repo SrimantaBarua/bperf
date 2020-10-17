@@ -24,7 +24,7 @@
 #define BPERF_DESC      "Kernel module for high frequency counter sampling on x86_64 systems"
 #define BPERF_VERSION   "0.1"
 #define BPERF_DEV_COUNT 1
-#define BPERF_BLK_SZ    64
+#define BPERF_BLK_SZ    2048
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
@@ -32,6 +32,35 @@ MODULE_LICENSE(BPERF_LICENSE);
 MODULE_AUTHOR(BPERF_AUTHOR);
 MODULE_DESCRIPTION(BPERF_DESC);
 MODULE_VERSION(BPERF_VERSION);
+
+/**
+ * @brief Read 64-bit data from an MSR
+ */
+static uint64_t bperf_rdmsr(uint32_t msr)
+{
+	uint32_t eax, edx;
+	__asm__("rdmsr\n" : "=a"(eax), "=d"(edx) : "c"(msr) : );
+	return ((uint64_t) edx << 32) | eax;
+}
+
+/**
+ * @brief Write 64-bit data to MSR
+ */
+static void bperf_wrmsr(uint32_t msr, uint64_t val)
+{
+	uint32_t eax, edx;
+	edx = (val >> 32) & 0xffffffff;
+	eax = val & 0xffffffff;
+	__asm__("wrmsr\n" : : "a"(eax), "d"(edx), "c"(msr) : "memory");
+}
+
+/**
+ * @brief Get information from CPUID
+ */
+static void bperf_cpuid(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+	__asm__("cpuid\n" : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx) : "a"(*eax), "c"(*ecx) : );
+}
 
 /**
  * @brief Linked list node of circular string buffer
@@ -257,9 +286,31 @@ static struct file_operations bperf_fops = {
 };
 
 /**
+ * @brief Identify processor
+ */
+static void bperf_identify_processor(void)
+{
+	uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0, stepping, model, family, ext_model;
+	bperf_cpuid(&eax, &ebx, &ecx, &edx);
+	// Information from EAX
+	stepping = eax & 0xf;
+	model = (eax >> 4) & 0xf;
+	family = (eax >> 8) & 0xf;
+	if (family == 0x06 || family == 0x0f) {
+		ext_model = (eax >> 16) & 0x0f;
+		model = (ext_model << 4) + model;
+	}
+	if (family == 0x0f) {
+		family += (eax >> 20) & 0xff;
+	}
+	printk(KERN_INFO "bperf: CPU family: %#x, model: %#x, stepping: %u\n", family, model, stepping);
+}
+
+/**
  * @brief Thread function for polling counters
  */
-static int bperf_thread_function(void *unused) {
+static int bperf_thread_function(void *unused)
+{
 	int i = 0;
 	while (!kthread_should_stop()) {
 		printk(KERN_INFO "bperf: Thread function: %d\n", i++);
@@ -276,21 +327,13 @@ static int __init bperf_init(void)
 	int ret;
 
 	printk(KERN_INFO "bperf: Loading...\n");
+	bperf_identify_processor();
 
 	// Allocate memory for string buffer
 	if ((ret = bperf_sbuffer_init(&STATE.sbuffer)) < 0) {
 		printk(KERN_ALERT "bperf: Failed to allocate string buffer\n");
 		return ret;
 	}
-	bperf_sbuffer_write(&STATE.sbuffer, "aaaaaaaa", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "bbbbbbbb", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "cccccccc", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "dddddddd", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "aaaaaaaa", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "bbbbbbbb", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "cccccccc", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "dddddddd", 8);
-	bperf_sbuffer_write(&STATE.sbuffer, "\n\0", 2);
 
 	// Try to dynamically allocate a major number for the device
 	if ((ret = alloc_chrdev_region(&STATE.dev, 0, BPERF_DEV_COUNT, BPERF_NAME)) < 0) {
