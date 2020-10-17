@@ -7,11 +7,14 @@
  */
 
 #include <linux/cdev.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -189,12 +192,13 @@ static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *de
  * @brief Global module state
  */
 static struct bperf_state {
-	dev_t                dev;        /* Stores the device number */
-	struct class         *class;     /* The device-driver class struct */
-	struct device        *device;    /* The device-driver device struct */
-	struct cdev          cdev;       /* Char device structure */
-	size_t               open_count; /* Current open count for device file */
-	struct bperf_sbuffer sbuffer;    /* Buffer of string data */
+	dev_t                dev;         /* Stores the device number */
+	struct class         *class;      /* The device-driver class struct */
+	struct device        *device;     /* The device-driver device struct */
+	struct cdev          cdev;        /* Char device structure */
+	size_t               open_count;  /* Current open count for device file */
+	struct bperf_sbuffer sbuffer;     /* Buffer of string data */
+	struct task_struct   *thread_ptr; /* Pointer to task struct for kernel thread */
 } STATE = { 0 };
 
 /**
@@ -253,6 +257,18 @@ static struct file_operations bperf_fops = {
 };
 
 /**
+ * @brief Thread function for polling counters
+ */
+static int bperf_thread_function(void *unused) {
+	int i = 0;
+	while (!kthread_should_stop()) {
+		printk(KERN_INFO "bperf: Thread function: %d\n", i++);
+		msleep(1000);
+	}
+	return 0;
+}
+
+/**
  * @brief The kernel module initialization function
  */
 static int __init bperf_init(void)
@@ -306,10 +322,19 @@ static int __init bperf_init(void)
 		goto error_cdev;
 	}
 
+	// Spawn kernel thread
+	if (!(STATE.thread_ptr = kthread_run(bperf_thread_function, NULL, "bperf_thread"))) {
+		printk(KERN_ALERT "bperf: Failed to spawn worker thread\n");
+		ret = PTR_ERR(STATE.thread_ptr);
+		goto error_thread;
+	}
+
 	// Success
 	printk(KERN_INFO "bperf: Loaded!\n");
 	return 0;
 
+error_thread:
+	cdev_del(&STATE.cdev);
 error_cdev:
 	device_destroy(STATE.class, STATE.dev);
 error_device:
@@ -326,6 +351,7 @@ static void __exit bperf_exit(void)
 {
 	printk(KERN_INFO "bperf: Unloading...\n");
 
+	kthread_stop(STATE.thread_ptr);
 	cdev_del(&STATE.cdev);
 	device_destroy(STATE.class, STATE.dev);
 	class_destroy(STATE.class);
