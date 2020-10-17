@@ -6,6 +6,7 @@
  * @brief A kernel module for high frequency counter sampling on x86_64 systems
  */
 
+#include <asm/smp.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -17,6 +18,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
 
 #define BPERF_NAME      "bperf"
 #define BPERF_LICENSE   "GPL"
@@ -28,10 +30,27 @@
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
-MODULE_LICENSE(BPERF_LICENSE);
-MODULE_AUTHOR(BPERF_AUTHOR);
-MODULE_DESCRIPTION(BPERF_DESC);
-MODULE_VERSION(BPERF_VERSION);
+/* MSR numbers */
+#define MSR_IA32_PMC(x)        (0xc1U + (x))
+#define MSR_IA32_PERFEVTSEL(x) (0x186U + (x))
+
+/* Architectural performance monitoring event select and umask */
+#define PERFEVTSEL_CORE_CYCLES 0x003cUL
+#define PERFEVTSEL_INST_RET    0x00c0UL
+#define PERFEVTSEL_REF_CYCLES  0x013cUL
+#define PERFEVTSEL_LLC_REF     0x4f2eUL
+#define PERFEVTSEL_LLC_MISS    0x412eUL
+#define PERFEVTSEL_BRANCH_RET  0x00c4UL
+#define PERFEVTSEL_BRANCH_MISS 0x00c5UL
+/* Architectural performance monitoring flags */
+#define PERFEVTSEL_RESERVED    0xffffffff00280000UL
+#define PERFEVTSEL_FLAG_USR    0x10000UL
+#define PERFEVTSEL_FLAG_OS     0x20000UL
+#define PERFEVTSEL_FLAG_ENABLE 0x400000UL
+#define PERFEVTSEL_FLAGS_SANE  (PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_ENABLE)
+
+/* Check flags in perfevtselx MSR data */
+#define PERFEVTSEL_ENABLED(x) (((x) & PERFEVTSEL_FLAG_ENABLE) != 0)
 
 /**
  * @brief Read 64-bit data from an MSR
@@ -91,7 +110,7 @@ static char* bperf_sbuffer_node_data(struct bperf_sbuffer_node *node)
 static struct bperf_sbuffer_node* bperf_sbuffer_node_new(void)
 {
 	struct bperf_sbuffer_node *ret = kmalloc(BPERF_BLK_SZ, GFP_KERNEL);
-	if (!ret) {
+	if (!ret || IS_ERR(ret)) {
 		printk(KERN_ALERT "bperf: kmalloc failed\n");
 		return NULL;
 	}
@@ -221,22 +240,22 @@ static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *de
  * @brief Global module state
  */
 static struct bperf_state {
-	// Kernel state
+	/* Kernel state */
 	dev_t         dev;         /* Stores the device number */
 	struct class  *class;      /* The device-driver class struct */
 	struct device *device;     /* The device-driver device struct */
 	struct cdev   cdev;        /* Char device structure */
-	// Module information
+	/* Module information */
 	size_t               open_count;  /* Current open count for device file */
 	struct bperf_sbuffer sbuffer;     /* Buffer of string data */
 	struct task_struct   *thread_ptr; /* Pointer to task struct for kernel thread */
-	// Performance monitoring capabilities
+	/* Performance monitoring capabilities */
 	uint32_t arch_perf_ver; /* Version ID of architectural performance monitoring */
 	uint32_t num_ctr;       /* Number of general purpose counters per logical processor */
 	uint32_t ctr_width;     /* Bit width of general purpose counters */
 	uint32_t num_fix_ctr;   /* Number of fixed function counters */
 	uint32_t fix_ctr_width; /* Bit width of fixed function counters */
-	// Whether specific events are available
+	/* Whether specific events are available */
 	bool     ev_core_cycle;        /* Core cycle event available */
 	bool     ev_inst_retired;      /* Instruction retired event available */
 	bool     ev_ref_cycles;        /* Reference cycles event available */
@@ -363,11 +382,41 @@ static void bperf_get_arch_perfmon_capabilities(void)
  */
 static int bperf_thread_function(void *unused)
 {
-	int i = 0;
-	while (!kthread_should_stop()) {
-		printk(KERN_INFO "bperf: Thread function: %d\n", i++);
-		msleep(1000);
+	// Set up perf monitoring
+	uint64_t perfevtsel_bak[1];
+	uint64_t perfevtsel_cur[1];
+	uint64_t pmc_last[1];
+	uint64_t pmc_cur[1];
+
+	// Get current state of perfevtsel MSR. If counting was enabled, disable it first
+	perfevtsel_bak[0] = bperf_rdmsr(MSR_IA32_PERFEVTSEL(0));
+	if (PERFEVTSEL_ENABLED(perfevtsel_bak[0])) {
+		bperf_wrmsr(MSR_IA32_PERFEVTSEL(0), perfevtsel_bak[0] & ~PERFEVTSEL_FLAG_ENABLE);
 	}
+	pmc_last[0] = bperf_rdmsr(MSR_IA32_PMC(0));
+
+	printk(KERN_INFO "bperf: Core: %u, original perfevtsel0: %#llx, cur pmc0: %#llx\n",
+			smp_processor_id(), perfevtsel_bak[0], pmc_last[0]);
+
+	perfevtsel_cur[0] = perfevtsel_bak[0] & PERFEVTSEL_RESERVED;
+	perfevtsel_cur[0] |= PERFEVTSEL_FLAGS_SANE | PERFEVTSEL_CORE_CYCLES;
+	bperf_wrmsr(MSR_IA32_PERFEVTSEL(0), perfevtsel_cur[0]);
+
+	while (!kthread_should_stop()) {
+		msleep(1000);
+		printk(KERN_INFO "bperf: Thread function: %u\n", smp_processor_id());
+		pmc_cur[0] = bperf_rdmsr(MSR_IA32_PMC(0));
+		if (pmc_cur[0] >= pmc_last[0]) {
+			printk(KERN_INFO "bperf: core cycles: %llu", pmc_cur[0] - pmc_last[0]);
+		} else {
+			printk(KERN_INFO "bperf: overflow\n");
+		}
+		pmc_last[0] = pmc_cur[0];
+	}
+
+	// Restore performance monitor settings
+	bperf_wrmsr(MSR_IA32_PERFEVTSEL(0), perfevtsel_bak[0]);
+
 	return 0;
 }
 
@@ -381,6 +430,12 @@ static int __init bperf_init(void)
 	printk(KERN_INFO "bperf: Loading...\n");
 	bperf_identify_processor();
 	bperf_get_arch_perfmon_capabilities();
+	if (STATE.arch_perf_ver <= 1) {
+		printk(KERN_ALERT "bperf: Not enough support for performance monitoring\n");
+		return -1;
+	}
+
+	printk(KERN_INFO "bperf: Num online CPUs: %u\n", num_online_cpus());
 
 	// Allocate memory for string buffer
 	if ((ret = bperf_sbuffer_init(&STATE.sbuffer)) < 0) {
@@ -419,11 +474,13 @@ static int __init bperf_init(void)
 	}
 
 	// Spawn kernel thread
-	if (!(STATE.thread_ptr = kthread_run(bperf_thread_function, NULL, "bperf_thread"))) {
+	if (IS_ERR(STATE.thread_ptr = kthread_create(bperf_thread_function, NULL, "bperf_thread"))) {
 		printk(KERN_ALERT "bperf: Failed to spawn worker thread\n");
 		ret = PTR_ERR(STATE.thread_ptr);
 		goto error_thread;
 	}
+	kthread_bind(STATE.thread_ptr, 1);
+	wake_up_process(STATE.thread_ptr);
 
 	// Success
 	printk(KERN_INFO "bperf: Loaded!\n");
@@ -462,3 +519,9 @@ static void __exit bperf_exit(void)
  */
 module_init(bperf_init);
 module_exit(bperf_exit);
+
+/* Linux kernel stuff */
+MODULE_LICENSE(BPERF_LICENSE);
+MODULE_AUTHOR(BPERF_AUTHOR);
+MODULE_DESCRIPTION(BPERF_DESC);
+MODULE_VERSION(BPERF_VERSION);
