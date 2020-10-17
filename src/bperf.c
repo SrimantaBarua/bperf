@@ -221,13 +221,29 @@ static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *de
  * @brief Global module state
  */
 static struct bperf_state {
-	dev_t                dev;         /* Stores the device number */
-	struct class         *class;      /* The device-driver class struct */
-	struct device        *device;     /* The device-driver device struct */
-	struct cdev          cdev;        /* Char device structure */
+	// Kernel state
+	dev_t         dev;         /* Stores the device number */
+	struct class  *class;      /* The device-driver class struct */
+	struct device *device;     /* The device-driver device struct */
+	struct cdev   cdev;        /* Char device structure */
+	// Module information
 	size_t               open_count;  /* Current open count for device file */
 	struct bperf_sbuffer sbuffer;     /* Buffer of string data */
 	struct task_struct   *thread_ptr; /* Pointer to task struct for kernel thread */
+	// Performance monitoring capabilities
+	uint32_t arch_perf_ver; /* Version ID of architectural performance monitoring */
+	uint32_t num_ctr;       /* Number of general purpose counters per logical processor */
+	uint32_t ctr_width;     /* Bit width of general purpose counters */
+	uint32_t num_fix_ctr;   /* Number of fixed function counters */
+	uint32_t fix_ctr_width; /* Bit width of fixed function counters */
+	// Whether specific events are available
+	bool     ev_core_cycle;        /* Core cycle event available */
+	bool     ev_inst_retired;      /* Instruction retired event available */
+	bool     ev_ref_cycles;        /* Reference cycles event available */
+	bool     ev_llc_ref;           /* LLC reference event available */
+	bool     ev_llc_miss;          /* LLC miss event available */
+	bool     ev_branch_retired;    /* Branch instruction retired event available */
+	bool     ev_branch_mispredict; /* Branch mispredict retired event available */
 } STATE = { 0 };
 
 /**
@@ -292,7 +308,6 @@ static void bperf_identify_processor(void)
 {
 	uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0, stepping, model, family, ext_model;
 	bperf_cpuid(&eax, &ebx, &ecx, &edx);
-	// Information from EAX
 	stepping = eax & 0xf;
 	model = (eax >> 4) & 0xf;
 	family = (eax >> 8) & 0xf;
@@ -303,7 +318,44 @@ static void bperf_identify_processor(void)
 	if (family == 0x0f) {
 		family += (eax >> 20) & 0xff;
 	}
-	printk(KERN_INFO "bperf: CPU family: %#x, model: %#x, stepping: %u\n", family, model, stepping);
+	printk(KERN_INFO "bperf: CPU family: %#x, model: %u, stepping: %u\n", family, model, stepping);
+}
+
+/**
+ * @brief Get architectural performance monitoring capabilities
+ */
+static void bperf_get_arch_perfmon_capabilities(void)
+{
+	uint32_t eax = 0x0a, ebx = 0, ecx = 0, edx = 0, bvsz;
+	bperf_cpuid(&eax, &ebx, &ecx, &edx);
+
+	STATE.arch_perf_ver = eax & 0xff;
+	STATE.num_ctr       = (eax >> 8) & 0xff;
+	STATE.ctr_width     = (eax >> 16) & 0xff;
+	bvsz                = (eax >> 24) & 0xff;
+
+	STATE.ev_core_cycle        = bvsz > 0 && !(ebx & (1 << 0));
+	STATE.ev_inst_retired      = bvsz > 1 && !(ebx & (1 << 1));
+	STATE.ev_ref_cycles        = bvsz > 2 && !(ebx & (1 << 2));
+	STATE.ev_llc_ref           = bvsz > 3 && !(ebx & (1 << 3));
+	STATE.ev_llc_miss          = bvsz > 4 && !(ebx & (1 << 4));
+	STATE.ev_branch_retired    = bvsz > 5 && !(ebx & (1 << 5));
+	STATE.ev_branch_mispredict = bvsz > 6 && !(ebx & (1 << 6));
+
+	if (STATE.arch_perf_ver > 1) {
+		STATE.num_fix_ctr = edx & 0x1f;
+		STATE.fix_ctr_width = (edx >> 5) & 0xff;
+	}
+
+	printk(KERN_INFO "bperf: Perf ver: %u, num ctr: %u, ctr width: %d\n"
+			 "       EBX: %#x\n"
+			 "       core cycles: %u, inst ret: %u, ref cycles: %u, llc ref: %u,"
+			 " llc miss: %u, branch ret: %u, branch mispredict: %u\n"
+			 "       num fixed ctr: %u, fix ctr size: %u\n",
+			 STATE.arch_perf_ver, STATE.num_ctr, STATE.ctr_width,
+			 ebx, STATE.ev_core_cycle, STATE.ev_inst_retired, STATE.ev_ref_cycles,
+			 STATE.ev_llc_miss, STATE.ev_llc_miss, STATE.ev_branch_retired,
+			 STATE.ev_branch_mispredict, STATE.num_fix_ctr, STATE.fix_ctr_width);
 }
 
 /**
@@ -328,6 +380,7 @@ static int __init bperf_init(void)
 
 	printk(KERN_INFO "bperf: Loading...\n");
 	bperf_identify_processor();
+	bperf_get_arch_perfmon_capabilities();
 
 	// Allocate memory for string buffer
 	if ((ret = bperf_sbuffer_init(&STATE.sbuffer)) < 0) {
