@@ -6,7 +6,6 @@
  * @brief A kernel module for high frequency counter sampling on x86_64 systems
  */
 
-#include <asm/smp.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -19,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <asm/smp.h>
 
 #define BPERF_NAME      "bperf"
 #define BPERF_LICENSE   "GPL"
@@ -34,14 +34,14 @@
 #define MSR_IA32_PMC(x)               (0xc1U + (x))
 #define MSR_IA32_PERFEVTSEL(x)        (0x186U + (x))
 #define MSR_IA32_FIXED_CTR(x)         (0x309U + (x))
-#define IA32_PERF_CAPABILITIES        0x345
-#define IA32_FIXED_CTR_CTRL           0x38d /* If version > 1 */
-#define IA32_PERF_GLOBAL_STATUS       0x38e
-#define IA32_PERF_GLOBAL_CTRL         0x38f
-#define IA32_PERF_GLOBAL_OVF_CTRL     0x390 /* If version > 0 && version <= 3 */
-#define IA32_PERF_GLOBAL_STATUS_RESET 0x390 /* If version > 3 */
-#define IA32_PERF_GLOBAL_STATUS_SET   0x391 /* If version > 3 */
-#define IA32_PERF_GLOBAL_INUSE        0x392 /* If version > 3 */
+#define MSR_IA32_PERF_CAPABILITIES        0x345
+#define MSR_IA32_FIXED_CTR_CTRL           0x38d /* If version > 1 */
+#define MSR_IA32_PERF_GLOBAL_STATUS       0x38e
+#define MSR_IA32_PERF_GLOBAL_CTRL         0x38f
+#define MSR_IA32_PERF_GLOBAL_OVF_CTRL     0x390 /* If version > 0 && version <= 3 */
+#define MSR_IA32_PERF_GLOBAL_STATUS_RESET 0x390 /* If version > 3 */
+#define MSR_IA32_PERF_GLOBAL_STATUS_SET   0x391 /* If version > 3 */
+#define MSR_IA32_PERF_GLOBAL_INUSE        0x392 /* If version > 3 */
 
 /* Architectural performance monitoring event select and umask */
 #define PERFEVTSEL_CORE_CYCLES 0x003cUL
@@ -87,7 +87,7 @@
 #define GLOBAL_OVFCTRL_CLR_FIXED0  (1UL << 32)
 #define GLOBAL_OVFCTRL_CLR_FIXED1  (1UL << 33)
 #define GLOBAL_OVFCTRL_CLR_FIXED2  (1UL << 34)
-#define GLOBAL_OVFCTRL_CLR_DSBUF   (1UL << 61) /* If version >= 3 */
+#define GLOBAL_OVFCTRL_CLR_UNCORE  (1UL << 61) /* If version >= 3 */
 #define GLOBAL_OVFCTRL_CLR_DSBUF   (1UL << 62)
 #define GLOBAL_OVFCTRL_CLR_CONDCHG (1UL << 63)
 
