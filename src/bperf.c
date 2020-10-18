@@ -31,8 +31,17 @@
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
 /* MSR numbers */
-#define MSR_IA32_PMC(x)        (0xc1U + (x))
-#define MSR_IA32_PERFEVTSEL(x) (0x186U + (x))
+#define MSR_IA32_PMC(x)               (0xc1U + (x))
+#define MSR_IA32_PERFEVTSEL(x)        (0x186U + (x))
+#define MSR_IA32_FIXED_CTR(x)         (0x309U + (x))
+#define IA32_PERF_CAPABILITIES        0x345
+#define IA32_FIXED_CTR_CTRL           0x38d /* If version > 1 */
+#define IA32_PERF_GLOBAL_STATUS       0x38e
+#define IA32_PERF_GLOBAL_CTRL         0x38f
+#define IA32_PERF_GLOBAL_OVF_CTRL     0x390 /* If version > 0 && version <= 3 */
+#define IA32_PERF_GLOBAL_STATUS_RESET 0x390 /* If version > 3 */
+#define IA32_PERF_GLOBAL_STATUS_SET   0x391 /* If version > 3 */
+#define IA32_PERF_GLOBAL_INUSE        0x392 /* If version > 3 */
 
 /* Architectural performance monitoring event select and umask */
 #define PERFEVTSEL_CORE_CYCLES 0x003cUL
@@ -43,11 +52,45 @@
 #define PERFEVTSEL_BRANCH_RET  0x00c4UL
 #define PERFEVTSEL_BRANCH_MISS 0x00c5UL
 /* Architectural performance monitoring flags */
-#define PERFEVTSEL_RESERVED    0xffffffff00280000UL
-#define PERFEVTSEL_FLAG_USR    0x10000UL
-#define PERFEVTSEL_FLAG_OS     0x20000UL
-#define PERFEVTSEL_FLAG_ENABLE 0x400000UL
-#define PERFEVTSEL_FLAGS_SANE  (PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_ENABLE)
+#define PERFEVTSEL_RESERVED     0xffffffff00280000UL
+#define PERFEVTSEL_FLAG_USR     0x10000UL
+#define PERFEVTSEL_FLAG_OS      0x20000UL
+#define PERFEVTSEL_FLAG_ANYTHRD 0x200000UL
+#define PERFEVTSEL_FLAG_ENABLE  0x400000UL
+#define PERFEVTSEL_FLAGS_SANE   (PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_ENABLE)
+
+/* Fixed counter ctrl */
+#define FIXED_CTRL_EN0    0x003UL
+#define FIXED_CTRL_ANY0   0x004UL
+#define FIXED_CTRL_EN1    0x030UL
+#define FIXED_CTRL_ANY1   0x040UL
+#define FIXED_CTRL_EN2    0x300UL
+#define FIXED_CTRL_ANY2   0x400UL
+
+/* Global counter ctrl */
+#define GLOBAL_CTRL_PMC(x) (1UL << (x))
+#define GLOBAL_CTRL_FIXED0 (1UL << 32)
+#define GLOBAL_CTRL_FIXED1 (1UL << 33)
+#define GLOBAL_CTRL_FIXED2 (1UL << 34)
+
+/* Global counter overflow status */
+#define GLOBAL_STATUS_PMC(x)  (1UL << (x))
+#define GLOBAL_STATUS_FIXED0  (1UL << 32)
+#define GLOBAL_STATUS_FIXED1  (1UL << 33)
+#define GLOBAL_STATUS_FIXED2  (1UL << 34)
+#define GLOBAL_STATUS_UNCORE  (1UL << 61) /* If version >= 3 */
+#define GLOBAL_STATUS_DSBUF   (1UL << 62)
+#define GLOBAL_STATUS_CONDCHG (1UL << 63)
+
+/* Global counter overflow ctrl */
+#define GLOBAL_OVFCTRL_CLR_PMC(x)  (1UL << (x))
+#define GLOBAL_OVFCTRL_CLR_FIXED0  (1UL << 32)
+#define GLOBAL_OVFCTRL_CLR_FIXED1  (1UL << 33)
+#define GLOBAL_OVFCTRL_CLR_FIXED2  (1UL << 34)
+#define GLOBAL_OVFCTRL_CLR_DSBUF   (1UL << 61) /* If version >= 3 */
+#define GLOBAL_OVFCTRL_CLR_DSBUF   (1UL << 62)
+#define GLOBAL_OVFCTRL_CLR_CONDCHG (1UL << 63)
+
 
 /* Check flags in perfevtselx MSR data */
 #define PERFEVTSEL_ENABLED(x) (((x) & PERFEVTSEL_FLAG_ENABLE) != 0)
@@ -453,14 +496,14 @@ static int __init bperf_init(void)
 	// Create class struct
 	if (IS_ERR(STATE.class = class_create(THIS_MODULE, BPERF_NAME))) {
 		printk(KERN_ALERT "bperf: Failed to register device class\n");
-		ret = PTR_ERR(STATE.class);
+		ret = PTR_ERR_OR_ZERO(STATE.class);
 		goto error_class;
 	}
 
 	// Create device
 	if (IS_ERR(STATE.device = device_create(STATE.class, NULL, STATE.dev, NULL, "bperf"))) {
 		printk(KERN_ALERT "bperf: Failed to create device file\n");
-		ret = PTR_ERR(STATE.device);
+		ret = PTR_ERR_OR_ZERO(STATE.device);
 		goto error_device;
 	}
 
@@ -476,7 +519,7 @@ static int __init bperf_init(void)
 	// Spawn kernel thread
 	if (IS_ERR(STATE.thread_ptr = kthread_create(bperf_thread_function, NULL, "bperf_thread"))) {
 		printk(KERN_ALERT "bperf: Failed to spawn worker thread\n");
-		ret = PTR_ERR(STATE.thread_ptr);
+		ret = PTR_ERR_OR_ZERO(STATE.thread_ptr);
 		goto error_thread;
 	}
 	kthread_bind(STATE.thread_ptr, 1);
