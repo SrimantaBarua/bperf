@@ -3,7 +3,7 @@
  * @author  Srimanta Barua <srimanta.barua1@gmail.com>
  * @date    27 September 2020
  * @version 0.1
- * @brief A kernel module for high frequency counter sampling on x86_64 systems
+ * @brief   A kernel module for high frequency counter sampling on x86_64 systems
  */
 
 #include <linux/cdev.h>
@@ -26,258 +26,11 @@
 #define BPERF_DESC      "Kernel module for high frequency counter sampling on x86_64 systems"
 #define BPERF_VERSION   "0.1"
 #define BPERF_DEV_COUNT 1
-#define BPERF_BLK_SZ    2048
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
-/* MSR numbers */
-#define MSR_IA32_PMC(x)               (0xc1U + (x))
-#define MSR_IA32_PERFEVTSEL(x)        (0x186U + (x))
-#define MSR_IA32_FIXED_CTR(x)         (0x309U + (x))
-#define MSR_IA32_PERF_CAPABILITIES        0x345
-#define MSR_IA32_FIXED_CTR_CTRL           0x38d /* If version > 1 */
-#define MSR_IA32_PERF_GLOBAL_STATUS       0x38e
-#define MSR_IA32_PERF_GLOBAL_CTRL         0x38f
-#define MSR_IA32_PERF_GLOBAL_OVF_CTRL     0x390 /* If version > 0 && version <= 3 */
-#define MSR_IA32_PERF_GLOBAL_STATUS_RESET 0x390 /* If version > 3 */
-#define MSR_IA32_PERF_GLOBAL_STATUS_SET   0x391 /* If version > 3 */
-#define MSR_IA32_PERF_GLOBAL_INUSE        0x392 /* If version > 3 */
-
-/* Architectural performance monitoring event select and umask */
-#define PERFEVTSEL_CORE_CYCLES 0x003cUL
-#define PERFEVTSEL_INST_RET    0x00c0UL
-#define PERFEVTSEL_REF_CYCLES  0x013cUL
-#define PERFEVTSEL_LLC_REF     0x4f2eUL
-#define PERFEVTSEL_LLC_MISS    0x412eUL
-#define PERFEVTSEL_BRANCH_RET  0x00c4UL
-#define PERFEVTSEL_BRANCH_MISS 0x00c5UL
-/* Architectural performance monitoring flags */
-#define PERFEVTSEL_RESERVED     0xffffffff00280000UL
-#define PERFEVTSEL_FLAG_USR     0x10000UL
-#define PERFEVTSEL_FLAG_OS      0x20000UL
-#define PERFEVTSEL_FLAG_ANYTHRD 0x200000UL
-#define PERFEVTSEL_FLAG_ENABLE  0x400000UL
-#define PERFEVTSEL_FLAGS_SANE   (PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_ENABLE)
-
-/* Fixed counter ctrl */
-#define FIXED_CTRL_EN0    0x003UL
-#define FIXED_CTRL_ANY0   0x004UL
-#define FIXED_CTRL_EN1    0x030UL
-#define FIXED_CTRL_ANY1   0x040UL
-#define FIXED_CTRL_EN2    0x300UL
-#define FIXED_CTRL_ANY2   0x400UL
-
-/* Global counter ctrl */
-#define GLOBAL_CTRL_PMC(x) (1UL << (x))
-#define GLOBAL_CTRL_FIXED0 (1UL << 32)
-#define GLOBAL_CTRL_FIXED1 (1UL << 33)
-#define GLOBAL_CTRL_FIXED2 (1UL << 34)
-
-/* Global counter overflow status */
-#define GLOBAL_STATUS_PMC(x)  (1UL << (x))
-#define GLOBAL_STATUS_FIXED0  (1UL << 32)
-#define GLOBAL_STATUS_FIXED1  (1UL << 33)
-#define GLOBAL_STATUS_FIXED2  (1UL << 34)
-#define GLOBAL_STATUS_UNCORE  (1UL << 61) /* If version >= 3 */
-#define GLOBAL_STATUS_DSBUF   (1UL << 62)
-#define GLOBAL_STATUS_CONDCHG (1UL << 63)
-
-/* Global counter overflow ctrl */
-#define GLOBAL_OVFCTRL_CLR_PMC(x)  (1UL << (x))
-#define GLOBAL_OVFCTRL_CLR_FIXED0  (1UL << 32)
-#define GLOBAL_OVFCTRL_CLR_FIXED1  (1UL << 33)
-#define GLOBAL_OVFCTRL_CLR_FIXED2  (1UL << 34)
-#define GLOBAL_OVFCTRL_CLR_UNCORE  (1UL << 61) /* If version >= 3 */
-#define GLOBAL_OVFCTRL_CLR_DSBUF   (1UL << 62)
-#define GLOBAL_OVFCTRL_CLR_CONDCHG (1UL << 63)
-
-
-/* Check flags in perfevtselx MSR data */
-#define PERFEVTSEL_ENABLED(x) (((x) & PERFEVTSEL_FLAG_ENABLE) != 0)
-
-/**
- * @brief Read 64-bit data from an MSR
- */
-static uint64_t bperf_rdmsr(uint32_t msr)
-{
-	uint32_t eax, edx;
-	__asm__("rdmsr\n" : "=a"(eax), "=d"(edx) : "c"(msr) : );
-	return ((uint64_t) edx << 32) | eax;
-}
-
-/**
- * @brief Write 64-bit data to MSR
- */
-static void bperf_wrmsr(uint32_t msr, uint64_t val)
-{
-	uint32_t eax, edx;
-	edx = (val >> 32) & 0xffffffff;
-	eax = val & 0xffffffff;
-	__asm__("wrmsr\n" : : "a"(eax), "d"(edx), "c"(msr) : "memory");
-}
-
-/**
- * @brief Get information from CPUID
- */
-static void bperf_cpuid(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
-{
-	__asm__("cpuid\n" : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx) : "a"(*eax), "c"(*ecx) : );
-}
-
-/**
- * @brief Linked list node of circular string buffer
- *
- * Total size of a node is BPERF_BLK_SZ bytes. This size includes this "header" struct. The data
- * starts immediately after it.
- */
-struct bperf_sbuffer_node {
-	size_t           start; /* Start index of unread data in this node */
-	size_t           size;  /* Amount of data stored in this node */
-	struct list_head list;  /* Linked list node */
-	/* Data follows immediately after this */
-};
-
-#define BPERF_SBUFFER_MAX_SZ (BPERF_BLK_SZ - sizeof(struct bperf_sbuffer_node))
-
-/**
- * @brief Get pointer to dat for node
- */
-static char* bperf_sbuffer_node_data(struct bperf_sbuffer_node *node)
-{
-	return ((char*) node) + sizeof(struct bperf_sbuffer_node);
-}
-
-/**
- * @brief Allocate a new empty buffer node
- */
-static struct bperf_sbuffer_node* bperf_sbuffer_node_new(void)
-{
-	struct bperf_sbuffer_node *ret = kmalloc(BPERF_BLK_SZ, GFP_KERNEL);
-	if (!ret || IS_ERR(ret)) {
-		printk(KERN_ALERT "bperf: kmalloc failed\n");
-		return NULL;
-	}
-	ret->start = ret->size = 0;
-	INIT_LIST_HEAD(&ret->list);
-	return ret;
-}
-
-/**
- * @brief Free memory for an allocated buffer node
- */
-static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node)
-{
-	list_del(&node->list);
-	kfree(node);
-}
-
-/**
- * @brief Circular buffer to write data to
- */
-struct bperf_sbuffer {
-	struct list_head list; /* Head node to linked list of buffers */
-};
-
-/**
- * @brief Initialize buffer
- */
-static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
-{
-	struct bperf_sbuffer_node *first_node;
-	INIT_LIST_HEAD(&sbuffer->list);
-	if (!(first_node = bperf_sbuffer_node_new())) {
-		return -ENOMEM;
-	}
-	list_add(&first_node->list, &sbuffer->list);
-	return 0;
-}
-
-/**
- * @brief Free memory for buffer
- */
-static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
-{
-	struct list_head *next, *node = sbuffer->list.next;
-	while (node != &sbuffer->list) {
-		next = node->next;
-		bperf_sbuffer_node_free(container_of(node, struct bperf_sbuffer_node, list));
-		node = next;
-	}
-}
-
-/**
- * @brief Write len bytes of data to the end of the buffer
- */
-static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, size_t len)
-{
-	struct bperf_sbuffer_node *last_node, *new_node;
-	ssize_t space_left, amt_to_write, ret = 0;
-	if (len == 0) {
-		return 0;
-	}
-
-	while (true) {
-		last_node = container_of(sbuffer->list.prev, struct bperf_sbuffer_node, list);
-		space_left = BPERF_SBUFFER_MAX_SZ - last_node->size;
-		amt_to_write = MIN(len - ret, space_left);
-
-		if (amt_to_write > 0) {
-			memcpy(bperf_sbuffer_node_data(last_node) + last_node->size, src + ret, amt_to_write);
-			ret += amt_to_write;
-			last_node->size += amt_to_write;
-		}
-		if (ret == len) {
-			return ret;
-		}
-
-		if (!(new_node = bperf_sbuffer_node_new())) {
-			return -ENOMEM;
-		}
-		list_add_tail(&new_node->list, &sbuffer->list);
-	}
-}
-
-/**
- * @brief Read upto len bytes of data from the buffer into the destination (user-space)
- */
-static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *dest, size_t len)
-{
-	ssize_t amt_data_in_node, amt_to_write, ret = 0;
-	struct list_head *ll_node = sbuffer->list.next;
-	struct bperf_sbuffer_node *node;
-
-	if (len == 0) {
-		return 0;
-	}
-
-	while (ll_node != &sbuffer->list) {
-		node = container_of(ll_node, struct bperf_sbuffer_node, list);
-		amt_data_in_node = node->size - node->start;
-		amt_to_write = MIN(amt_data_in_node, len - ret);
-
-		if (amt_to_write == 0) {
-			if (node->size == BPERF_SBUFFER_MAX_SZ) {
-				ll_node = ll_node->next;
-				bperf_sbuffer_node_free(node);
-				continue;
-			} else {
-				break;
-			}
-		} else {
-			amt_to_write -= copy_to_user(dest + ret, bperf_sbuffer_node_data(node) + node->start, amt_to_write);
-			if (amt_to_write == 0) {
-				break;
-			}
-			node->start += amt_to_write;
-			ret += amt_to_write;
-		}
-		if (ret == len) {
-			return ret;
-		}
-	}
-
-	return ret;
-}
+#include "hardware.c"
+#include "sbuffer.c"
 
 /**
  * @brief Global module state
@@ -432,23 +185,23 @@ static int bperf_thread_function(void *unused)
 	uint64_t pmc_cur[1];
 
 	// Get current state of perfevtsel MSR. If counting was enabled, disable it first
-	perfevtsel_bak[0] = bperf_rdmsr(MSR_IA32_PERFEVTSEL(0));
+	perfevtsel_bak[0] = bperf_rdmsr(MSR_PERFEVTSEL(0));
 	if (PERFEVTSEL_ENABLED(perfevtsel_bak[0])) {
-		bperf_wrmsr(MSR_IA32_PERFEVTSEL(0), perfevtsel_bak[0] & ~PERFEVTSEL_FLAG_ENABLE);
+		bperf_wrmsr(MSR_PERFEVTSEL(0), perfevtsel_bak[0] & ~PERFEVTSEL_FLAG_ENABLE);
 	}
-	pmc_last[0] = bperf_rdmsr(MSR_IA32_PMC(0));
+	pmc_last[0] = bperf_rdmsr(MSR_PMC(0));
 
 	printk(KERN_INFO "bperf: Core: %u, original perfevtsel0: %#llx, cur pmc0: %#llx\n",
 			smp_processor_id(), perfevtsel_bak[0], pmc_last[0]);
 
 	perfevtsel_cur[0] = perfevtsel_bak[0] & PERFEVTSEL_RESERVED;
 	perfevtsel_cur[0] |= PERFEVTSEL_FLAGS_SANE | PERFEVTSEL_CORE_CYCLES;
-	bperf_wrmsr(MSR_IA32_PERFEVTSEL(0), perfevtsel_cur[0]);
+	bperf_wrmsr(MSR_PERFEVTSEL(0), perfevtsel_cur[0]);
 
 	while (!kthread_should_stop()) {
 		msleep(1000);
 		printk(KERN_INFO "bperf: Thread function: %u\n", smp_processor_id());
-		pmc_cur[0] = bperf_rdmsr(MSR_IA32_PMC(0));
+		pmc_cur[0] = bperf_rdmsr(MSR_PMC(0));
 		if (pmc_cur[0] >= pmc_last[0]) {
 			printk(KERN_INFO "bperf: core cycles: %llu", pmc_cur[0] - pmc_last[0]);
 		} else {
@@ -458,7 +211,7 @@ static int bperf_thread_function(void *unused)
 	}
 
 	// Restore performance monitor settings
-	bperf_wrmsr(MSR_IA32_PERFEVTSEL(0), perfevtsel_bak[0]);
+	bperf_wrmsr(MSR_PERFEVTSEL(0), perfevtsel_bak[0]);
 
 	return 0;
 }
@@ -522,7 +275,7 @@ static int __init bperf_init(void)
 		ret = PTR_ERR_OR_ZERO(STATE.thread_ptr);
 		goto error_thread;
 	}
-	kthread_bind(STATE.thread_ptr, 1);
+	kthread_bind(STATE.thread_ptr, 0);
 	wake_up_process(STATE.thread_ptr);
 
 	// Success
