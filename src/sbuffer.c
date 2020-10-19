@@ -60,7 +60,7 @@ static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node)
  */
 struct bperf_sbuffer {
 	struct list_head list; /* Head node to linked list of buffers */
-};
+} SBUFFER = { 0 };
 
 /**
  * @brief Initialize buffer
@@ -148,9 +148,8 @@ static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *de
 				break;
 			}
 		} else {
-			amt_to_write -= copy_to_user(dest + ret, bperf_sbuffer_node_data(node) + node->start, amt_to_write);
-			if (amt_to_write == 0) {
-				break;
+			if (copy_to_user(dest + ret, bperf_sbuffer_node_data(node) + node->start, amt_to_write)) {
+				return -EFAULT;
 			}
 			node->start += amt_to_write;
 			ret += amt_to_write;

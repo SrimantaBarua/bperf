@@ -6,6 +6,7 @@
  * @brief   A kernel module for high frequency counter sampling on x86_64 systems
  */
 
+#include <stdarg.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -13,11 +14,14 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/timekeeping.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 #include <asm/smp.h>
 
 #define BPERF_NAME      "bperf"
@@ -25,9 +29,15 @@
 #define BPERF_AUTHOR    "Srimanta Barua <srimanta.barua1@gmail.com>"
 #define BPERF_DESC      "Kernel module for high frequency counter sampling on x86_64 systems"
 #define BPERF_VERSION   "0.1"
-#define BPERF_DEV_COUNT 1
+#define BPERF_HZ        5
+#define BPERF_MIN_ARCH  2
+#define BPERF_MSLEEP    (1000 / BPERF_HZ)
+
+#define BPERF_MAX_PMC   4
+#define BPERF_MAX_FIXED 3
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
 
 #include "hardware.c"
 #include "sbuffer.c"
@@ -42,9 +52,9 @@ static struct bperf_state {
 	struct device *device;     /* The device-driver device struct */
 	struct cdev   cdev;        /* Char device structure */
 	/* Module information */
-	size_t               open_count;  /* Current open count for device file */
-	struct bperf_sbuffer sbuffer;     /* Buffer of string data */
-	struct task_struct   *thread_ptr; /* Pointer to task struct for kernel thread */
+	size_t             open_count;   /* Current open count for device file */
+	size_t             num_threads;  /* Number of threads we spawned */
+	struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
 	/* Performance monitoring capabilities */
 	uint32_t arch_perf_ver; /* Version ID of architectural performance monitoring */
 	uint32_t num_ctr;       /* Number of general purpose counters per logical processor */
@@ -52,14 +62,16 @@ static struct bperf_state {
 	uint32_t num_fix_ctr;   /* Number of fixed function counters */
 	uint32_t fix_ctr_width; /* Bit width of fixed function counters */
 	/* Whether specific events are available */
-	bool     ev_core_cycle;        /* Core cycle event available */
-	bool     ev_inst_retired;      /* Instruction retired event available */
-	bool     ev_ref_cycles;        /* Reference cycles event available */
-	bool     ev_llc_ref;           /* LLC reference event available */
-	bool     ev_llc_miss;          /* LLC miss event available */
-	bool     ev_branch_retired;    /* Branch instruction retired event available */
-	bool     ev_branch_mispredict; /* Branch mispredict retired event available */
+	bool ev_core_cycle;        /* Core cycle event available */
+	bool ev_inst_retired;      /* Instruction retired event available */
+	bool ev_ref_cycles;        /* Reference cycles event available */
+	bool ev_llc_ref;           /* LLC reference event available */
+	bool ev_llc_miss;          /* LLC miss event available */
+	bool ev_branch_retired;    /* Branch instruction retired event available */
+	bool ev_branch_mispredict; /* Branch mispredict retired event available */
 } STATE = { 0 };
+
+#include "dbuffer.c"
 
 /**
  * @brief Dummy llseek function. Basically we don't support seeking
@@ -98,7 +110,7 @@ static int bperf_release(struct inode *inode, struct file *filp)
 static ssize_t bperf_read(struct file *filp, char __user *buffer, size_t size, loff_t *f_pos)
 {
 	struct bperf_state *state = filp->private_data;
-	ssize_t ret = bperf_sbuffer_read(&state->sbuffer, buffer, size);
+	ssize_t ret = bperf_sbuffer_read(&SBUFFER, buffer, size);
 	if (ret > 0) {
 		*f_pos += ret;
 	}
@@ -146,6 +158,7 @@ static void bperf_get_arch_perfmon_capabilities(void)
 
 	STATE.arch_perf_ver = eax & 0xff;
 	STATE.num_ctr       = (eax >> 8) & 0xff;
+	STATE.num_ctr       = MAX(STATE.num_ctr, BPERF_MAX_PMC);
 	STATE.ctr_width     = (eax >> 16) & 0xff;
 	bvsz                = (eax >> 24) & 0xff;
 
@@ -159,6 +172,7 @@ static void bperf_get_arch_perfmon_capabilities(void)
 
 	if (STATE.arch_perf_ver > 1) {
 		STATE.num_fix_ctr = edx & 0x1f;
+		STATE.num_fix_ctr = MAX(STATE.num_fix_ctr, BPERF_MAX_FIXED);
 		STATE.fix_ctr_width = (edx >> 5) & 0xff;
 	}
 
@@ -176,42 +190,93 @@ static void bperf_get_arch_perfmon_capabilities(void)
 /**
  * @brief Thread function for polling counters
  */
-static int bperf_thread_function(void *unused)
+static int bperf_thread_function(void *arg_thread_id)
 {
-	// Set up perf monitoring
-	uint64_t perfevtsel_bak[1];
-	uint64_t perfevtsel_cur[1];
-	uint64_t pmc_last[1];
-	uint64_t pmc_cur[1];
+	// The events that we want per PMC
+	// FIXME: Align with BPERF_MAX_FIXED and BPERF_MAX_PMC
+	static uint64_t pmc_events[4] = {
+		PERFEVTSEL_CORE_CYCLES,
+		PERFEVTSEL_LLC_MISS,
+		PERFEVTSEL_BRANCH_MISS,
+		PERFEVTSEL_LLC_REF
+	};
 
-	// Get current state of perfevtsel MSR. If counting was enabled, disable it first
-	perfevtsel_bak[0] = bperf_rdmsr(MSR_PERFEVTSEL(0));
-	if (PERFEVTSEL_ENABLED(perfevtsel_bak[0])) {
-		bperf_wrmsr(MSR_PERFEVTSEL(0), perfevtsel_bak[0] & ~PERFEVTSEL_FLAG_ENABLE);
+	uint32_t i;
+	uint64_t r, w, ctrl;
+	size_t thread_id;
+	struct bperf_dbuffer_thread *thread_state;
+	thread_id = (size_t) arg_thread_id;
+	thread_state = &DBUFFER.data[thread_id];
+	memset(thread_state, 0, sizeof(struct bperf_dbuffer_thread));
+
+	// Get current state of PERF_GLOBAL_CTRL and disable monitoring
+	ctrl = thread_state->global_ctrl_bak = bperf_rdmsr(MSR_PERF_GLOBAL_CTRL);
+	ctrl &= GLOBAL_CTRL_RESERVED;
+	bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
+
+	// Get current state of PERFEVTSEL and PMC MSR. Set counting as enabled
+	for (i = 0; i < STATE.num_ctr; i++) {
+		w = thread_state->perfevtsel_bak[i] = bperf_rdmsr(MSR_PERFEVTSEL(i));
+		w &= PERFEVTSEL_RESERVED;
+		if (STATE.arch_perf_ver >= 3) {
+			w &= ~PERFEVTSEL_FLAG_ANYTHRD;
+		}
+		w |= PERFEVTSEL_FLAGS_SANE | pmc_events[i];
+		bperf_wrmsr(MSR_PERFEVTSEL(i), w);
+		// Get current value of the PMC
+		thread_state->last_pmc[i] = bperf_rdmsr(MSR_PMC(i));
+		thread_state->has_pmc[i] = true;
+		ctrl |= GLOBAL_CTRL_PMC(i);
 	}
-	pmc_last[0] = bperf_rdmsr(MSR_PMC(0));
 
-	printk(KERN_INFO "bperf: Core: %u, original perfevtsel0: %#llx, cur pmc0: %#llx\n",
-			smp_processor_id(), perfevtsel_bak[0], pmc_last[0]);
+	// Get current state of fixed counters
+	w = thread_state->fixed_ctrl_bak = bperf_rdmsr(MSR_FIXED_CTR_CTRL);
+	w &= FIXED_CTRL_RESERVED;
+	for (i = 0; i < STATE.num_fix_ctr; i++) {
+		w |= FIXED_CTRL_EN(i);
+		ctrl |= GLOBAL_CTRL_FIXED(i);
+		thread_state->last_fixed[i] = bperf_rdmsr(MSR_FIXED_CTR(i));
+		thread_state->has_fixed[i] = true;
+	}
+	bperf_wrmsr(MSR_FIXED_CTR_CTRL, w);
 
-	perfevtsel_cur[0] = perfevtsel_bak[0] & PERFEVTSEL_RESERVED;
-	perfevtsel_cur[0] |= PERFEVTSEL_FLAGS_SANE | PERFEVTSEL_CORE_CYCLES;
-	bperf_wrmsr(MSR_PERFEVTSEL(0), perfevtsel_cur[0]);
+	// Enable performance monitoring
+	bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
 
 	while (!kthread_should_stop()) {
-		msleep(1000);
-		printk(KERN_INFO "bperf: Thread function: %u\n", smp_processor_id());
-		pmc_cur[0] = bperf_rdmsr(MSR_PMC(0));
-		if (pmc_cur[0] >= pmc_last[0]) {
-			printk(KERN_INFO "bperf: core cycles: %llu", pmc_cur[0] - pmc_last[0]);
-		} else {
-			printk(KERN_INFO "bperf: overflow\n");
+		msleep(BPERF_MSLEEP);
+		thread_state->timestamp = ktime_get_ns();
+		printk(KERN_INFO "bperf: Thread function: %u, ts: %#llx\n", smp_processor_id(), thread_state->timestamp);
+		for (i = 0; i < STATE.num_ctr; i++) {
+			r = bperf_rdmsr(MSR_PMC(i));
+			if (r < thread_state->last_pmc[i]) {
+				thread_state->pmc[i] = 0;
+			} else {
+				thread_state->pmc[i] = r - thread_state->last_pmc[i];
+			}
+			thread_state->last_pmc[i] = r;
 		}
-		pmc_last[0] = pmc_cur[0];
+		for (i = 0; i < STATE.num_fix_ctr; i++) {
+			r = bperf_rdmsr(MSR_FIXED_CTR(i));
+			if (r < thread_state->last_fixed[i]) {
+				thread_state->fixed[i] = 0;
+			} else {
+				thread_state->fixed[i] = r - thread_state->last_fixed[i];
+			}
+			thread_state->last_fixed[i] = r;
+		}
+		bperf_dbuffer_thread_checkin(&DBUFFER, thread_id);
 	}
 
 	// Restore performance monitor settings
-	bperf_wrmsr(MSR_PERFEVTSEL(0), perfevtsel_bak[0]);
+	ctrl = bperf_rdmsr(MSR_PERF_GLOBAL_CTRL);
+	ctrl &= GLOBAL_CTRL_RESERVED;
+	bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
+	for (i = 0; i < STATE.num_ctr; i++) {
+		bperf_wrmsr(MSR_PERFEVTSEL(i), thread_state->perfevtsel_bak[i]);
+	}
+	bperf_wrmsr(MSR_FIXED_CTR_CTRL, thread_state->fixed_ctrl_bak);
+	bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, thread_state->global_ctrl_bak);
 
 	return 0;
 }
@@ -222,41 +287,42 @@ static int bperf_thread_function(void *unused)
 static int __init bperf_init(void)
 {
 	int ret;
+	size_t i;
 
 	printk(KERN_INFO "bperf: Loading...\n");
 	bperf_identify_processor();
 	bperf_get_arch_perfmon_capabilities();
-	if (STATE.arch_perf_ver <= 1) {
+	if (STATE.arch_perf_ver < BPERF_MIN_ARCH) {
 		printk(KERN_ALERT "bperf: Not enough support for performance monitoring\n");
 		return -1;
 	}
 
-	printk(KERN_INFO "bperf: Num online CPUs: %u\n", num_online_cpus());
-
 	// Allocate memory for string buffer
-	if ((ret = bperf_sbuffer_init(&STATE.sbuffer)) < 0) {
+	if ((ret = bperf_sbuffer_init(&SBUFFER)) < 0) {
 		printk(KERN_ALERT "bperf: Failed to allocate string buffer\n");
 		return ret;
 	}
 
 	// Try to dynamically allocate a major number for the device
-	if ((ret = alloc_chrdev_region(&STATE.dev, 0, BPERF_DEV_COUNT, BPERF_NAME)) < 0) {
+	if ((ret = alloc_chrdev_region(&STATE.dev, 0, 1, BPERF_NAME)) < 0) {
 		printk(KERN_ALERT "bperf: Could not allocate major number\n");
-		return ret;
+		goto error_major_number;
 	}
 	printk(KERN_INFO "bperf: device = %d,%d\n", MAJOR(STATE.dev), MINOR(STATE.dev));
 
 	// Create class struct
-	if (IS_ERR(STATE.class = class_create(THIS_MODULE, BPERF_NAME))) {
+	STATE.class = class_create(THIS_MODULE, BPERF_NAME);
+	if (!STATE.class || IS_ERR(STATE.class)) {
 		printk(KERN_ALERT "bperf: Failed to register device class\n");
-		ret = PTR_ERR_OR_ZERO(STATE.class);
+		ret = PTR_ERR(STATE.class);
 		goto error_class;
 	}
 
 	// Create device
-	if (IS_ERR(STATE.device = device_create(STATE.class, NULL, STATE.dev, NULL, "bperf"))) {
+	STATE.device = device_create(STATE.class, NULL, STATE.dev, NULL, "bperf");
+	if (!STATE.device || IS_ERR(STATE.device)) {
 		printk(KERN_ALERT "bperf: Failed to create device file\n");
-		ret = PTR_ERR_OR_ZERO(STATE.device);
+		ret = PTR_ERR(STATE.device);
 		goto error_device;
 	}
 
@@ -269,27 +335,54 @@ static int __init bperf_init(void)
 		goto error_cdev;
 	}
 
-	// Spawn kernel thread
-	if (IS_ERR(STATE.thread_ptr = kthread_create(bperf_thread_function, NULL, "bperf_thread"))) {
-		printk(KERN_ALERT "bperf: Failed to spawn worker thread\n");
-		ret = PTR_ERR_OR_ZERO(STATE.thread_ptr);
-		goto error_thread;
+	// Allocate buffers for all threads
+	// FIXME: Handle non-linear core numbers
+	// FIXME: Handle CPU hotplug
+	STATE.num_threads = num_online_cpus();
+	printk(KERN_INFO "bperf: Num online CPUs: %lu\n", STATE.num_threads);
+	if ((ret = bperf_dbuffer_init(&DBUFFER, STATE.num_threads)) < 0) {
+		goto error_dbuffer;
 	}
-	kthread_bind(STATE.thread_ptr, 0);
-	wake_up_process(STATE.thread_ptr);
+
+	// Spawn kernel thread per logical core
+	STATE.thread_ptr = kvmalloc(STATE.num_threads * sizeof(struct task_struct*), GFP_KERNEL);
+	if (!STATE.thread_ptr || IS_ERR(STATE.thread_ptr)) {
+		printk(KERN_ALERT "bperf: Failed to allocate array of thread pointers\n");
+		ret = PTR_ERR(STATE.thread_ptr);
+		goto error_thread_alloc;
+	}
+
+	for (i = 0; i < STATE.num_threads; i++) {
+		STATE.thread_ptr[i] = kthread_create(bperf_thread_function, (void*) i, "bperf_thread");
+		if (!STATE.thread_ptr[i] || IS_ERR(STATE.thread_ptr[i])) {
+			printk(KERN_ALERT "bperf: Failed to spawn worker thread\n");
+			ret = PTR_ERR(STATE.thread_ptr[i]);
+			goto error_thread_create;
+		}
+		kthread_bind(STATE.thread_ptr[i], i);
+	}
+	for (i = 0; i < STATE.num_threads; i++) {
+		wake_up_process(STATE.thread_ptr[i]);
+	}
 
 	// Success
 	printk(KERN_INFO "bperf: Loaded!\n");
 	return 0;
 
-error_thread:
+error_thread_create:
+	kvfree(STATE.thread_ptr);
+error_thread_alloc:
+	bperf_dbuffer_fini(&DBUFFER);
+error_dbuffer:
 	cdev_del(&STATE.cdev);
 error_cdev:
 	device_destroy(STATE.class, STATE.dev);
 error_device:
 	class_destroy(STATE.class);
 error_class:
-	unregister_chrdev_region(STATE.dev, BPERF_DEV_COUNT);
+	unregister_chrdev_region(STATE.dev, 1);
+error_major_number:
+	bperf_sbuffer_fini(&SBUFFER);
 	return ret;
 }
 
@@ -298,14 +391,19 @@ error_class:
  */
 static void __exit bperf_exit(void)
 {
+	size_t i;
 	printk(KERN_INFO "bperf: Unloading...\n");
 
-	kthread_stop(STATE.thread_ptr);
+	for (i = 0; i < STATE.num_threads; i++) {
+		kthread_stop(STATE.thread_ptr[i]);
+	}
+	kvfree(STATE.thread_ptr);
+	bperf_dbuffer_fini(&DBUFFER);
 	cdev_del(&STATE.cdev);
 	device_destroy(STATE.class, STATE.dev);
 	class_destroy(STATE.class);
-	unregister_chrdev_region(STATE.dev, BPERF_DEV_COUNT);
-	bperf_sbuffer_fini(&STATE.sbuffer);
+	unregister_chrdev_region(STATE.dev, 1);
+	bperf_sbuffer_fini(&SBUFFER);
 
 	printk(KERN_INFO "bperf: Unloaded!\n");
 }

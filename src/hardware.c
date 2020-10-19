@@ -7,9 +7,9 @@
  */
 
 /* MSR numbers */
-#define MSR_PMC(x)               (0xc1U + (x))
-#define MSR_PERFEVTSEL(x)        (0x186U + (x))
-#define MSR_FIXED_CTR(x)         (0x309U + (x))
+#define MSR_PMC(x)                   (0xc1U + (x))
+#define MSR_PERFEVTSEL(x)            (0x186U + (x))
+#define MSR_FIXED_CTR(x)             (0x309U + (x))
 #define MSR_PERF_CAPABILITIES        0x345
 #define MSR_FIXED_CTR_CTRL           0x38d /* If version > 1 */
 #define MSR_PERF_GLOBAL_STATUS       0x38e
@@ -36,36 +36,28 @@
 #define PERFEVTSEL_FLAGS_SANE   (PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_ENABLE)
 
 /* Fixed counter ctrl */
-#define FIXED_CTRL_EN0    0x003UL
-#define FIXED_CTRL_ANY0   0x004UL
-#define FIXED_CTRL_EN1    0x030UL
-#define FIXED_CTRL_ANY1   0x040UL
-#define FIXED_CTRL_EN2    0x300UL
-#define FIXED_CTRL_ANY2   0x400UL
+#define FIXED_CTRL_RESERVED 0xfffffffffffff000UL
+#define FIXED_CTRL_EN(x)    (0x003UL << ((x) * 4))
+#define FIXED_CTRL_ANY(x)   (0x004UL << ((x) * 4))
 
 /* Global counter ctrl */
-#define GLOBAL_CTRL_PMC(x) (1UL << (x))
-#define GLOBAL_CTRL_FIXED0 (1UL << 32)
-#define GLOBAL_CTRL_FIXED1 (1UL << 33)
-#define GLOBAL_CTRL_FIXED2 (1UL << 34)
+#define GLOBAL_CTRL_RESERVED 0xfffffff8fffffff0
+#define GLOBAL_CTRL_PMC(x)   (1UL << (x))
+#define GLOBAL_CTRL_FIXED(x) (1UL << (32 + (x)))
 
 /* Global counter overflow status */
-#define GLOBAL_STATUS_PMC(x)  (1UL << (x))
-#define GLOBAL_STATUS_FIXED0  (1UL << 32)
-#define GLOBAL_STATUS_FIXED1  (1UL << 33)
-#define GLOBAL_STATUS_FIXED2  (1UL << 34)
-#define GLOBAL_STATUS_UNCORE  (1UL << 61) /* If version >= 3 */
-#define GLOBAL_STATUS_DSBUF   (1UL << 62)
-#define GLOBAL_STATUS_CONDCHG (1UL << 63)
+#define GLOBAL_STATUS_PMC(x)   (1UL << (x))
+#define GLOBAL_STATUS_FIXED(x) (1UL << (32 + (x)))
+#define GLOBAL_STATUS_UNCORE   (1UL << 61) /* If version >= 3 */
+#define GLOBAL_STATUS_DSBUF    (1UL << 62)
+#define GLOBAL_STATUS_CONDCHG  (1UL << 63)
 
 /* Global counter overflow ctrl */
-#define GLOBAL_OVFCTRL_CLR_PMC(x)  (1UL << (x))
-#define GLOBAL_OVFCTRL_CLR_FIXED0  (1UL << 32)
-#define GLOBAL_OVFCTRL_CLR_FIXED1  (1UL << 33)
-#define GLOBAL_OVFCTRL_CLR_FIXED2  (1UL << 34)
-#define GLOBAL_OVFCTRL_CLR_UNCORE  (1UL << 61) /* If version >= 3 */
-#define GLOBAL_OVFCTRL_CLR_DSBUF   (1UL << 62)
-#define GLOBAL_OVFCTRL_CLR_CONDCHG (1UL << 63)
+#define GLOBAL_OVFCTRL_CLR_PMC(x)   (1UL << (x))
+#define GLOBAL_OVFCTRL_CLR_FIXED(x) (1UL << (32 + (x)))
+#define GLOBAL_OVFCTRL_CLR_UNCORE   (1UL << 61) /* If version >= 3 */
+#define GLOBAL_OVFCTRL_CLR_DSBUF    (1UL << 62)
+#define GLOBAL_OVFCTRL_CLR_CONDCHG  (1UL << 63)
 
 
 /* Check flags in perfevtselx MSR data */
