@@ -39,8 +39,422 @@
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
-#include "hardware.c"
-#include "sbuffer.c"
+// ======== MSRs, hardware counters ========
+
+/* MSR numbers */
+#define MSR_PMC(x)                   (0xc1U + (x))
+#define MSR_PERFEVTSEL(x)            (0x186U + (x))
+#define MSR_FIXED_CTR(x)             (0x309U + (x))
+#define MSR_PERF_CAPABILITIES        0x345
+#define MSR_FIXED_CTR_CTRL           0x38d /* If version > 1 */
+#define MSR_PERF_GLOBAL_STATUS       0x38e
+#define MSR_PERF_GLOBAL_CTRL         0x38f
+#define MSR_PERF_GLOBAL_OVF_CTRL     0x390 /* If version > 0 && version <= 3 */
+#define MSR_PERF_GLOBAL_STATUS_RESET 0x390 /* If version > 3 */
+#define MSR_PERF_GLOBAL_STATUS_SET   0x391 /* If version > 3 */
+#define MSR_PERF_GLOBAL_INUSE        0x392 /* If version > 3 */
+
+/* Architectural performance monitoring event select and umask */
+#define PERFEVTSEL_CORE_CYCLES 0x003cUL
+#define PERFEVTSEL_INST_RET    0x00c0UL
+#define PERFEVTSEL_REF_CYCLES  0x013cUL
+#define PERFEVTSEL_LLC_REF     0x4f2eUL
+#define PERFEVTSEL_LLC_MISS    0x412eUL
+#define PERFEVTSEL_BRANCH_RET  0x00c4UL
+#define PERFEVTSEL_BRANCH_MISS 0x00c5UL
+/* Architectural performance monitoring flags */
+#define PERFEVTSEL_RESERVED     0xffffffff00280000UL
+#define PERFEVTSEL_FLAG_USR     0x10000UL
+#define PERFEVTSEL_FLAG_OS      0x20000UL
+#define PERFEVTSEL_FLAG_ANYTHRD 0x200000UL
+#define PERFEVTSEL_FLAG_ENABLE  0x400000UL
+#define PERFEVTSEL_FLAGS_SANE   (PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_ENABLE)
+
+/* Fixed counter ctrl */
+#define FIXED_CTRL_RESERVED 0xfffffffffffff000UL
+#define FIXED_CTRL_EN(x)    (0x003UL << ((x) * 4))
+#define FIXED_CTRL_ANY(x)   (0x004UL << ((x) * 4))
+
+/* Global counter ctrl */
+#define GLOBAL_CTRL_RESERVED 0xfffffff8fffffff0
+#define GLOBAL_CTRL_PMC(x)   (1UL << (x))
+#define GLOBAL_CTRL_FIXED(x) (1UL << (32 + (x)))
+
+/* Global counter overflow status */
+#define GLOBAL_STATUS_PMC(x)   (1UL << (x))
+#define GLOBAL_STATUS_FIXED(x) (1UL << (32 + (x)))
+#define GLOBAL_STATUS_UNCORE   (1UL << 61) /* If version >= 3 */
+#define GLOBAL_STATUS_DSBUF    (1UL << 62)
+#define GLOBAL_STATUS_CONDCHG  (1UL << 63)
+
+/* Global counter overflow ctrl */
+#define GLOBAL_OVFCTRL_CLR_PMC(x)   (1UL << (x))
+#define GLOBAL_OVFCTRL_CLR_FIXED(x) (1UL << (32 + (x)))
+#define GLOBAL_OVFCTRL_CLR_UNCORE   (1UL << 61) /* If version >= 3 */
+#define GLOBAL_OVFCTRL_CLR_DSBUF    (1UL << 62)
+#define GLOBAL_OVFCTRL_CLR_CONDCHG  (1UL << 63)
+
+/* Check flags in perfevtselx MSR data */
+#define PERFEVTSEL_ENABLED(x) (((x) & PERFEVTSEL_FLAG_ENABLE) != 0)
+
+/**
+ * @brief Read 64-bit data from an MSR
+ */
+static uint64_t bperf_rdmsr(uint32_t msr)
+{
+	uint32_t eax, edx;
+	__asm__("rdmsr\n" : "=a"(eax), "=d"(edx) : "c"(msr) : );
+	return ((uint64_t) edx << 32) | eax;
+}
+
+/**
+ * @brief Write 64-bit data to MSR
+ */
+static void bperf_wrmsr(uint32_t msr, uint64_t val)
+{
+	uint32_t eax, edx;
+	edx = (val >> 32) & 0xffffffff;
+	eax = val & 0xffffffff;
+	__asm__("wrmsr\n" : : "a"(eax), "d"(edx), "c"(msr) : "memory");
+}
+
+/**
+ * @brief Get information from CPUID
+ */
+static void bperf_cpuid(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+	__asm__("cpuid\n" : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx) : "a"(*eax), "c"(*ecx) : );
+}
+
+// ======== String buffer ========
+
+#define BPERF_SBUFFER_BLK_SZ    2048
+
+/**
+ * @brief Linked list node of circular string buffer
+ *
+ * Total size of a node is BPERF_SBUFFER_BLK_SZ bytes. This size includes this "header" struct.
+ * The data starts immediately after it.
+ */
+struct bperf_sbuffer_node {
+	size_t           start; /* Start index of unread data in this node */
+	size_t           size;  /* Amount of data stored in this node */
+	struct list_head list;  /* Linked list node */
+	/* Data follows immediately after this */
+};
+
+#define BPERF_SBUFFER_MAX_SZ (BPERF_SBUFFER_BLK_SZ - sizeof(struct bperf_sbuffer_node))
+
+/**
+ * @brief Get pointer to dat for node
+ */
+static char* bperf_sbuffer_node_data(struct bperf_sbuffer_node *node)
+{
+	return ((char*) node) + sizeof(struct bperf_sbuffer_node);
+}
+
+/**
+ * @brief Allocate a new empty buffer node
+ */
+static struct bperf_sbuffer_node* bperf_sbuffer_node_new(void)
+{
+	struct bperf_sbuffer_node *ret = kmalloc(BPERF_SBUFFER_BLK_SZ, GFP_KERNEL);
+	if (!ret || IS_ERR(ret)) {
+		printk(KERN_ALERT "bperf: kmalloc failed\n");
+		return NULL;
+	}
+	ret->start = ret->size = 0;
+	INIT_LIST_HEAD(&ret->list);
+	return ret;
+}
+
+/**
+ * @brief Free memory for an allocated buffer node
+ */
+static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node)
+{
+	list_del(&node->list);
+	kfree(node);
+}
+
+/**
+ * @brief Circular buffer to write data to
+ */
+struct bperf_sbuffer {
+	struct list_head list; /* Head node to linked list of buffers */
+} SBUFFER = { 0 };
+
+/**
+ * @brief Initialize buffer
+ */
+static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
+{
+	struct bperf_sbuffer_node *first_node;
+	INIT_LIST_HEAD(&sbuffer->list);
+	if (!(first_node = bperf_sbuffer_node_new())) {
+		return -ENOMEM;
+	}
+	list_add(&first_node->list, &sbuffer->list);
+	return 0;
+}
+
+/**
+ * @brief Free memory for buffer
+ */
+static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
+{
+	struct list_head *next, *node = sbuffer->list.next;
+	while (node != &sbuffer->list) {
+		next = node->next;
+		bperf_sbuffer_node_free(container_of(node, struct bperf_sbuffer_node, list));
+		node = next;
+	}
+}
+
+/**
+ * @brief Write len bytes of data to the end of the buffer
+ */
+static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, size_t len)
+{
+	struct bperf_sbuffer_node *last_node, *new_node;
+	ssize_t space_left, amt_to_write, ret = 0;
+	if (len == 0) {
+		return 0;
+	}
+
+	while (true) {
+		last_node = container_of(sbuffer->list.prev, struct bperf_sbuffer_node, list);
+		space_left = BPERF_SBUFFER_MAX_SZ - last_node->size;
+		amt_to_write = MIN(len - ret, space_left);
+
+		if (amt_to_write > 0) {
+			memcpy(bperf_sbuffer_node_data(last_node) + last_node->size, src + ret, amt_to_write);
+			ret += amt_to_write;
+			last_node->size += amt_to_write;
+		}
+		if (ret == len) {
+			return ret;
+		}
+
+		if (!(new_node = bperf_sbuffer_node_new())) {
+			return -ENOMEM;
+		}
+		list_add_tail(&new_node->list, &sbuffer->list);
+	}
+}
+
+/**
+ * @brief Read upto len bytes of data from the buffer into the destination (user-space)
+ */
+static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *dest, size_t len)
+{
+	ssize_t amt_data_in_node, amt_to_write, ret = 0;
+	struct list_head *ll_node = sbuffer->list.next;
+	struct bperf_sbuffer_node *node;
+
+	if (len == 0) {
+		return 0;
+	}
+
+	while (ll_node != &sbuffer->list) {
+		node = container_of(ll_node, struct bperf_sbuffer_node, list);
+		amt_data_in_node = node->size - node->start;
+		amt_to_write = MIN(amt_data_in_node, len - ret);
+
+		if (amt_to_write == 0) {
+			if (node->size == BPERF_SBUFFER_MAX_SZ) {
+				ll_node = ll_node->next;
+				bperf_sbuffer_node_free(node);
+				continue;
+			} else {
+				break;
+			}
+		} else {
+			if (copy_to_user(dest + ret, bperf_sbuffer_node_data(node) + node->start, amt_to_write)) {
+				return -EFAULT;
+			}
+			node->start += amt_to_write;
+			ret += amt_to_write;
+		}
+		if (ret == len) {
+			return ret;
+		}
+	}
+
+	return ret;
+}
+
+// ======== Synchronized data buffer ========
+
+/**
+ * @brief Waitqueue for threads waiting to write data
+ */
+static DECLARE_WAIT_QUEUE_HEAD(BPERF_WQ);
+
+/**
+ * @brief Static buffer before writing to string buffer
+ */
+#define SNPRINTF_BUFSZ 4096
+static char SNPRINTF_BUFFER[SNPRINTF_BUFSZ];
+static int SNPRINTF_WRITTEN = 0;
+
+/**
+ * @brief Write formatted data to static staging buffer
+ */
+static void bperf_snprintf(const char *fmt, ...)
+{
+	va_list args;
+	int ret = 0;
+	while (true) {
+		va_start(args, fmt);
+		ret = vsnprintf(SNPRINTF_BUFFER + SNPRINTF_WRITTEN, SNPRINTF_BUFSZ - SNPRINTF_WRITTEN, fmt, args);
+		if (ret + SNPRINTF_WRITTEN >= SNPRINTF_BUFSZ) {
+			ret = bperf_sbuffer_write(&SBUFFER, SNPRINTF_BUFFER, SNPRINTF_WRITTEN);
+			SNPRINTF_WRITTEN -= ret;
+			if (SNPRINTF_WRITTEN > 0) {
+				memcpy(SNPRINTF_BUFFER, SNPRINTF_BUFFER + ret, SNPRINTF_WRITTEN);
+			}
+			va_end(args);
+		} else {
+			SNPRINTF_WRITTEN += ret;
+			va_end(args);
+			break;
+		}
+	}
+}
+
+/**
+ * @brief Flush staged string to buffer
+ */
+static void bperf_snprintf_flush(void)
+{
+	int ret;
+	while (SNPRINTF_WRITTEN > 0) {
+		ret = bperf_sbuffer_write(&SBUFFER, SNPRINTF_BUFFER, SNPRINTF_WRITTEN);
+		SNPRINTF_WRITTEN -= ret;
+		if (SNPRINTF_WRITTEN > 0) {
+			memcpy(SNPRINTF_BUFFER, SNPRINTF_BUFFER + ret, SNPRINTF_WRITTEN);
+		}
+	}
+}
+
+/**
+ * @brief A data node for a single thread
+ */
+struct bperf_dbuffer_thread {
+	uint64_t perfevtsel_bak[BPERF_MAX_PMC]; /* Back up perfevtsel registers */
+	uint64_t fixed_ctrl_bak;                /* Back up fixed ctrl register */
+	uint64_t global_ctrl_bak;               /* Back up perf global ctrl register */
+	uint64_t timestamp;                     /* Timestamp in nanoseconds */
+	uint64_t last_pmc[BPERF_MAX_PMC];       /* Last PMCx reading */
+	uint64_t last_fixed[BPERF_MAX_FIXED];   /* Last fixed counter reading */
+	uint64_t pmc[BPERF_MAX_PMC];            /* PMCx increment */
+	uint64_t fixed[BPERF_MAX_FIXED];        /* fixed counter increment */
+	bool     has_pmc[BPERF_MAX_PMC];        /* Whether data for this PMCx is present */
+	bool     has_fixed[BPERF_MAX_FIXED];    /* Whether data for this fixed counter is present */
+};
+
+/**
+ * @brief A variable-sized data node for a single timestamp
+ */
+struct bperf_dbuffer {
+	size_t                      num_threads; /* Number of threads */
+	atomic_t                    to_check_in; /* Number of threads to check in */
+	bool                        *checked_in; /* Whether the given thread has checked in its data */
+	struct bperf_dbuffer_thread *data;       /* Per-thread data */
+} DBUFFER = { 0 };
+
+/**
+ * @brief Initialize buffer
+ */
+static int bperf_dbuffer_init(struct bperf_dbuffer *db, size_t nthreads)
+{
+	db->data = kvmalloc(nthreads * sizeof(struct bperf_dbuffer_thread), GFP_KERNEL);
+	if (!db->data || IS_ERR(db->data)) {
+		printk(KERN_ALERT "bperf: Failed to initialize data buffer: kvmalloc failed\n");
+		return -ENOMEM;
+	}
+	db->checked_in = kvmalloc(nthreads * sizeof(bool), GFP_KERNEL);
+	if (!db->checked_in || IS_ERR(db->checked_in)) {
+		kvfree(db->data);
+		printk(KERN_ALERT "bperf: Failed to initialize checked_in array: kvmalloc failed\n");
+		return -ENOMEM;
+	}
+	memset(db->checked_in, 0, nthreads * sizeof(bool));
+	db->num_threads = nthreads;
+	atomic_set(&db->to_check_in, db->num_threads);
+	return 0;
+}
+
+/**
+ * @brief Free memory for buffer
+ */
+static void bperf_dbuffer_fini(struct bperf_dbuffer *dbuffer)
+{
+	kvfree(dbuffer->data);
+}
+
+/**
+ * @brief Write measured data to string buffer
+ */
+static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread_id)
+{
+	size_t i;
+	uint64_t timestamp = dbuffer->data[thread_id].timestamp;
+
+	bperf_snprintf("timestamp: %llu\n", timestamp);
+
+#define write_x(X) do { \
+	bperf_snprintf(#X ": ");\
+	for (i = 0; i < dbuffer->num_threads; i++) { \
+		if (!dbuffer->data[i].has_ ## X) { \
+			continue; \
+		} \
+		bperf_snprintf("%llu ", dbuffer->data[i].X); \
+	} \
+	bperf_snprintf("\n"); \
+} while (0)
+
+	// FIXME: Align with BPERF_MAX_FIXED and BPERF_MAX_PMC
+	write_x(pmc[0]);
+	write_x(pmc[1]);
+	write_x(pmc[2]);
+	write_x(pmc[3]);
+	write_x(fixed[0]);
+	write_x(fixed[1]);
+	write_x(fixed[2]);
+	write_x(fixed[3]);
+
+	bperf_snprintf_flush();
+}
+
+/**
+ * @brief Notify that thread has finished writing data, and block if required
+ */
+static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t thread_id)
+{
+	if (thread_id >= dbuffer->num_threads) {
+		printk(KERN_ALERT "bperf: Invalid thread id: %lu: max: %lu\n", thread_id, dbuffer->num_threads);
+		return;
+	}
+	printk(KERN_INFO "bperf: Thread %lu check-in start\n", thread_id);
+	wait_event_interruptible(BPERF_WQ, kthread_should_stop() || !dbuffer->checked_in[thread_id]);
+	if (kthread_should_stop()) {
+		return;
+	}
+	printk(KERN_INFO "bperf: Thread %lu check-in done: checked_in: %d: atomic: %u\n", thread_id, dbuffer->checked_in[thread_id], atomic_read(&dbuffer->to_check_in));
+	dbuffer->checked_in[thread_id] = true;
+
+	if (atomic_dec_and_test(&dbuffer->to_check_in)) {
+		printk(KERN_INFO "bperf: Thread %lu writing to sbuffer\n", thread_id);
+		bperf_dbuffer_to_string(dbuffer, thread_id);
+		atomic_set(&dbuffer->to_check_in, dbuffer->num_threads);
+		memset(dbuffer->checked_in, 0, dbuffer->num_threads * sizeof(bool));
+		wake_up_interruptible(&BPERF_WQ);
+	}
+}
+
+// ======== Module logic ==========
 
 /**
  * @brief Global module state
@@ -52,7 +466,6 @@ static struct bperf_state {
 	struct device *device;     /* The device-driver device struct */
 	struct cdev   cdev;        /* Char device structure */
 	/* Module information */
-	size_t             open_count;   /* Current open count for device file */
 	size_t             num_threads;  /* Number of threads we spawned */
 	struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
 	/* Performance monitoring capabilities */
@@ -71,8 +484,6 @@ static struct bperf_state {
 	bool ev_branch_mispredict; /* Branch mispredict retired event available */
 } STATE = { 0 };
 
-#include "dbuffer.c"
-
 /**
  * @brief Dummy llseek function. Basically we don't support seeking
  */
@@ -86,9 +497,6 @@ static loff_t bperf_llseek(struct file *filp, loff_t off, int whence)
  */
 static int bperf_open(struct inode *inode, struct file *filp)
 {
-	struct bperf_state *state = container_of(inode->i_cdev, struct bperf_state, cdev);
-	state->open_count++;
-	filp->private_data = state;
 	printk(KERN_INFO "bperf: Device file opened\n");
 	return 0;
 }
@@ -98,8 +506,6 @@ static int bperf_open(struct inode *inode, struct file *filp)
  */
 static int bperf_release(struct inode *inode, struct file *filp)
 {
-	struct bperf_state *state = container_of(inode->i_cdev, struct bperf_state, cdev);
-	state->open_count--;
 	printk(KERN_INFO "bperf: Device file closed\n");
 	return 0;
 }
@@ -109,7 +515,6 @@ static int bperf_release(struct inode *inode, struct file *filp)
  */
 static ssize_t bperf_read(struct file *filp, char __user *buffer, size_t size, loff_t *f_pos)
 {
-	struct bperf_state *state = filp->private_data;
 	ssize_t ret = bperf_sbuffer_read(&SBUFFER, buffer, size);
 	if (ret > 0) {
 		*f_pos += ret;
