@@ -234,6 +234,13 @@ static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, siz
 
     mutex_lock_interruptible(&sbuffer->mutex);
 
+    if (list_empty(&sbuffer->list)) {
+        if (!(new_node = bperf_sbuffer_node_new())) {
+            return -ENOMEM;
+        }
+        list_add(&new_node->list, &sbuffer->list);
+    }
+
     while (true) {
         last_node = container_of(sbuffer->list.prev, struct bperf_sbuffer_node, list);
         space_left = BPERF_SBUFFER_MAX_SZ - last_node->size;
