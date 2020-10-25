@@ -257,10 +257,10 @@ static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, siz
     }
 
 out:
+    mutex_unlock(&sbuffer->mutex);
     if (ret > 0) {
         wake_up_interruptible(&sbuffer->waitq);
     }
-    mutex_unlock(&sbuffer->mutex);
     return ret;
 }
 
@@ -432,6 +432,7 @@ static int bperf_dbuffer_init(struct bperf_dbuffer *db, size_t nthreads)
 static void bperf_dbuffer_fini(struct bperf_dbuffer *dbuffer)
 {
     kvfree(dbuffer->data);
+    kvfree(dbuffer->checked_in);
 }
 
 /**
