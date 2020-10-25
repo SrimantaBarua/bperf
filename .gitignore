@@ -5,3 +5,7 @@ Module.symvers
 *.ko
 *.mod
 *.mod.c
+.clangd
+*.qcow2
+*.json
+*.txt
