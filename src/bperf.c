@@ -16,6 +16,7 @@
 #include <linux/kthread.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/timekeeping.h>
@@ -181,7 +182,10 @@ static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node)
  * @brief Circular buffer to write data to
  */
 struct bperf_sbuffer {
-	struct list_head list; /* Head node to linked list of buffers */
+	struct list_head  list;  /* Head node to linked list of buffers */
+    struct mutex      mutex; /* Mutex for access to the buffer */
+    size_t            size;  /* Amount of data currently in buffer */
+    wait_queue_head_t waitq; /* Wait queue of readers */
 } SBUFFER = { 0 };
 
 /**
@@ -195,6 +199,9 @@ static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
 		return -ENOMEM;
 	}
 	list_add(&first_node->list, &sbuffer->list);
+    mutex_init(&sbuffer->mutex);
+    init_waitqueue_head(&sbuffer->waitq);
+    sbuffer->size = 0;
 	return 0;
 }
 
@@ -203,12 +210,15 @@ static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
  */
 static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
 {
-	struct list_head *next, *node = sbuffer->list.next;
+	struct list_head *next, *node;
+    mutex_lock_interruptible(&sbuffer->mutex);
+    node = sbuffer->list.next;
 	while (node != &sbuffer->list) {
 		next = node->next;
 		bperf_sbuffer_node_free(container_of(node, struct bperf_sbuffer_node, list));
 		node = next;
 	}
+    mutex_unlock(&sbuffer->mutex);
 }
 
 /**
@@ -222,6 +232,8 @@ static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, siz
 		return 0;
 	}
 
+    mutex_lock_interruptible(&sbuffer->mutex);
+
 	while (true) {
 		last_node = container_of(sbuffer->list.prev, struct bperf_sbuffer_node, list);
 		space_left = BPERF_SBUFFER_MAX_SZ - last_node->size;
@@ -230,32 +242,56 @@ static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, siz
 		if (amt_to_write > 0) {
 			memcpy(bperf_sbuffer_node_data(last_node) + last_node->size, src + ret, amt_to_write);
 			ret += amt_to_write;
+            sbuffer->size += amt_to_write;
 			last_node->size += amt_to_write;
 		}
 		if (ret == len) {
-			return ret;
+            goto out;
 		}
 
 		if (!(new_node = bperf_sbuffer_node_new())) {
-			return -ENOMEM;
+            ret = -ENOMEM;
+            goto out;
 		}
 		list_add_tail(&new_node->list, &sbuffer->list);
 	}
+
+out:
+    if (ret > 0) {
+        wake_up_interruptible(&sbuffer->waitq);
+    }
+    mutex_unlock(&sbuffer->mutex);
+    return ret;
 }
 
 /**
  * @brief Read upto len bytes of data from the buffer into the destination (user-space)
  */
-static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *dest, size_t len)
+static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *dest, size_t len, bool blocking)
 {
 	ssize_t amt_data_in_node, amt_to_write, ret = 0;
-	struct list_head *ll_node = sbuffer->list.next;
+	struct list_head *ll_node;
 	struct bperf_sbuffer_node *node;
 
 	if (len == 0) {
 		return 0;
 	}
 
+    mutex_lock_interruptible(&sbuffer->mutex);
+
+    // Block while there isn't data to read
+    while (sbuffer->size == 0) {
+        mutex_unlock(&sbuffer->mutex);
+        if (!blocking) {
+            return -EAGAIN;
+        }
+        if (wait_event_interruptible(sbuffer->waitq, sbuffer->size > 0)) {
+            return -ERESTARTSYS;
+        }
+        mutex_lock_interruptible(&sbuffer->mutex);
+    }
+
+    ll_node = sbuffer->list.next;
 	while (ll_node != &sbuffer->list) {
 		node = container_of(ll_node, struct bperf_sbuffer_node, list);
 		amt_data_in_node = node->size - node->start;
@@ -271,16 +307,20 @@ static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *de
 			}
 		} else {
 			if (copy_to_user(dest + ret, bperf_sbuffer_node_data(node) + node->start, amt_to_write)) {
-				return -EFAULT;
+                ret = -EFAULT;
+                goto out;
 			}
 			node->start += amt_to_write;
 			ret += amt_to_write;
+            sbuffer->size -= amt_to_write;
 		}
 		if (ret == len) {
-			return ret;
+            goto out;
 		}
 	}
 
+out:
+    mutex_unlock(&sbuffer->mutex);
 	return ret;
 }
 
@@ -515,7 +555,7 @@ static int bperf_release(struct inode *inode, struct file *filp)
  */
 static ssize_t bperf_read(struct file *filp, char __user *buffer, size_t size, loff_t *f_pos)
 {
-	ssize_t ret = bperf_sbuffer_read(&SBUFFER, buffer, size);
+	ssize_t ret = bperf_sbuffer_read(&SBUFFER, buffer, size, (filp->f_flags & O_NONBLOCK) == 0);
 	if (ret > 0) {
 		*f_pos += ret;
 	}
