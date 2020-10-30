@@ -40,6 +40,38 @@
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
+// ======== Module state (available to userspace) ========
+
+/**
+ * @brief Number of general purpose performance monitoring counters
+ */
+static volatile uint32_t num_pmc = 0;
+
+static ssize_t num_pmc_attr_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u", num_pmc);
+}
+static struct kobj_attribute num_pmc_attr = __ATTR(num_pmc, 0660, num_pmc_attr_show, NULL);
+
+/**
+ * @brief Number of fixed function performance monitoring counters
+ */
+static volatile uint32_t num_fixed = 0;
+
+static ssize_t num_fixed_attr_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u", num_fixed);
+}
+static struct kobj_attribute num_fixed_attr = __ATTR(num_fixed, 0660, num_fixed_attr_show, NULL);
+
+/**
+ * @brief Version ID of architectural performance monitoring
+ */
+static volatile uint32_t arch_perf_ver = 0;
+
+static ssize_t arch_perf_ver_attr_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u", arch_perf_ver);
+}
+static struct kobj_attribute arch_perf_ver_attr = __ATTR(arch_perf_ver, 0660, arch_perf_ver_attr_show, NULL);
+
 // ======== MSRs, hardware counters ========
 
 /* MSR numbers */
@@ -509,18 +541,16 @@ static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t t
  */
 static struct bperf_state {
     /* Kernel state */
-    dev_t         dev;         /* Stores the device number */
-    struct class  *class;      /* The device-driver class struct */
-    struct device *device;     /* The device-driver device struct */
-    struct cdev   cdev;        /* Char device structure */
+    dev_t          dev;     /* Stores the device number */
+    struct class   *class;  /* The device-driver class struct */
+    struct device  *device; /* The device-driver device struct */
+    struct cdev    cdev;    /* Char device structure */
+    struct kobject *kobj;   /* Kernel object for sysfs */
     /* Module information */
     size_t             num_threads;  /* Number of threads we spawned */
     struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
     /* Performance monitoring capabilities */
-    uint32_t arch_perf_ver; /* Version ID of architectural performance monitoring */
-    uint32_t num_ctr;       /* Number of general purpose counters per logical processor */
     uint32_t ctr_width;     /* Bit width of general purpose counters */
-    uint32_t num_fix_ctr;   /* Number of fixed function counters */
     uint32_t fix_ctr_width; /* Bit width of fixed function counters */
     /* Whether specific events are available */
     bool ev_core_cycle;        /* Core cycle event available */
@@ -609,11 +639,11 @@ static void bperf_get_arch_perfmon_capabilities(void)
     uint32_t eax = 0x0a, ebx = 0, ecx = 0, edx = 0, bvsz;
     bperf_cpuid(&eax, &ebx, &ecx, &edx);
 
-    STATE.arch_perf_ver = eax & 0xff;
-    STATE.num_ctr       = (eax >> 8) & 0xff;
-    STATE.num_ctr       = MAX(STATE.num_ctr, BPERF_MAX_PMC);
-    STATE.ctr_width     = (eax >> 16) & 0xff;
-    bvsz                = (eax >> 24) & 0xff;
+    arch_perf_ver   = eax & 0xff;
+    num_pmc         = (eax >> 8) & 0xff;
+    num_pmc         = MIN(num_pmc, BPERF_MAX_PMC);
+    STATE.ctr_width = (eax >> 16) & 0xff;
+    bvsz            = (eax >> 24) & 0xff;
 
     STATE.ev_core_cycle        = bvsz > 0 && !(ebx & (1 << 0));
     STATE.ev_inst_retired      = bvsz > 1 && !(ebx & (1 << 1));
@@ -623,9 +653,9 @@ static void bperf_get_arch_perfmon_capabilities(void)
     STATE.ev_branch_retired    = bvsz > 5 && !(ebx & (1 << 5));
     STATE.ev_branch_mispredict = bvsz > 6 && !(ebx & (1 << 6));
 
-    if (STATE.arch_perf_ver > 1) {
-        STATE.num_fix_ctr = edx & 0x1f;
-        STATE.num_fix_ctr = MAX(STATE.num_fix_ctr, BPERF_MAX_FIXED);
+    if (arch_perf_ver > 1) {
+        num_fixed           = edx & 0x1f;
+        num_fixed           = MIN(num_fixed, BPERF_MAX_FIXED);
         STATE.fix_ctr_width = (edx >> 5) & 0xff;
     }
 
@@ -634,10 +664,10 @@ static void bperf_get_arch_perfmon_capabilities(void)
              "       core cycles: %u, inst ret: %u, ref cycles: %u, llc ref: %u,"
              " llc miss: %u, branch ret: %u, branch mispredict: %u\n"
              "       num fixed ctr: %u, fix ctr size: %u\n",
-             STATE.arch_perf_ver, STATE.num_ctr, STATE.ctr_width,
-             ebx, STATE.ev_core_cycle, STATE.ev_inst_retired, STATE.ev_ref_cycles,
-             STATE.ev_llc_miss, STATE.ev_llc_miss, STATE.ev_branch_retired,
-             STATE.ev_branch_mispredict, STATE.num_fix_ctr, STATE.fix_ctr_width);
+             arch_perf_ver, num_pmc, STATE.ctr_width, ebx, STATE.ev_core_cycle,
+             STATE.ev_inst_retired, STATE.ev_ref_cycles, STATE.ev_llc_miss,
+             STATE.ev_llc_miss, STATE.ev_branch_retired, STATE.ev_branch_mispredict,
+             num_fixed, STATE.fix_ctr_width);
 }
 
 /**
@@ -668,10 +698,10 @@ static int bperf_thread_function(void *arg_thread_id)
     bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
 
     // Get current state of PERFEVTSEL and PMC MSR. Set counting as enabled
-    for (i = 0; i < STATE.num_ctr; i++) {
+    for (i = 0; i < num_pmc; i++) {
         w = thread_state->perfevtsel_bak[i] = bperf_rdmsr(MSR_PERFEVTSEL(i));
         w &= PERFEVTSEL_RESERVED;
-        if (STATE.arch_perf_ver >= 3) {
+        if (arch_perf_ver >= 3) {
             w &= ~PERFEVTSEL_FLAG_ANYTHRD;
         }
         w |= PERFEVTSEL_FLAGS_SANE | pmc_events[i];
@@ -685,7 +715,7 @@ static int bperf_thread_function(void *arg_thread_id)
     // Get current state of fixed counters
     w = thread_state->fixed_ctrl_bak = bperf_rdmsr(MSR_FIXED_CTR_CTRL);
     w &= FIXED_CTRL_RESERVED;
-    for (i = 0; i < STATE.num_fix_ctr; i++) {
+    for (i = 0; i < num_fixed; i++) {
         w |= FIXED_CTRL_EN(i);
         ctrl |= GLOBAL_CTRL_FIXED(i);
         thread_state->last_fixed[i] = bperf_rdmsr(MSR_FIXED_CTR(i));
@@ -700,7 +730,7 @@ static int bperf_thread_function(void *arg_thread_id)
         msleep(BPERF_MSLEEP);
         thread_state->timestamp = ktime_get_ns();
         printk(KERN_INFO "bperf: Thread function: %u, ts: %#llx\n", smp_processor_id(), thread_state->timestamp);
-        for (i = 0; i < STATE.num_ctr; i++) {
+        for (i = 0; i < num_pmc; i++) {
             r = bperf_rdmsr(MSR_PMC(i));
             if (r < thread_state->last_pmc[i]) {
                 thread_state->pmc[i] = 0;
@@ -709,7 +739,7 @@ static int bperf_thread_function(void *arg_thread_id)
             }
             thread_state->last_pmc[i] = r;
         }
-        for (i = 0; i < STATE.num_fix_ctr; i++) {
+        for (i = 0; i < num_fixed; i++) {
             r = bperf_rdmsr(MSR_FIXED_CTR(i));
             if (r < thread_state->last_fixed[i]) {
                 thread_state->fixed[i] = 0;
@@ -725,7 +755,7 @@ static int bperf_thread_function(void *arg_thread_id)
     ctrl = bperf_rdmsr(MSR_PERF_GLOBAL_CTRL);
     ctrl &= GLOBAL_CTRL_RESERVED;
     bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
-    for (i = 0; i < STATE.num_ctr; i++) {
+    for (i = 0; i < num_pmc; i++) {
         bperf_wrmsr(MSR_PERFEVTSEL(i), thread_state->perfevtsel_bak[i]);
     }
     bperf_wrmsr(MSR_FIXED_CTR_CTRL, thread_state->fixed_ctrl_bak);
@@ -745,7 +775,7 @@ static int __init bperf_init(void)
     printk(KERN_INFO "bperf: Loading...\n");
     bperf_identify_processor();
     bperf_get_arch_perfmon_capabilities();
-    if (STATE.arch_perf_ver < BPERF_MIN_ARCH) {
+    if (arch_perf_ver < BPERF_MIN_ARCH) {
         printk(KERN_ALERT "bperf: Not enough support for performance monitoring\n");
         return -1;
     }
@@ -788,6 +818,26 @@ static int __init bperf_init(void)
         goto error_cdev;
     }
 
+    // Initialize kobject and attributes
+    STATE.kobj = kobject_create_and_add("bperf", kernel_kobj);
+    if (!STATE.kobj || IS_ERR(STATE.kobj)) {
+        printk(KERN_ALERT "bperf: Failed to create kobject\n");
+        ret = PTR_ERR(STATE.kobj);
+        goto error_kobj;
+    }
+    if ((ret = sysfs_create_file(STATE.kobj, &num_pmc_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_pmc_attr;
+    }
+    if ((ret = sysfs_create_file(STATE.kobj, &num_fixed_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_fixed_attr;
+    }
+    if ((ret = sysfs_create_file(STATE.kobj, &arch_perf_ver_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_perf_ver_attr;
+    }
+
     // Allocate buffers for all threads
     // FIXME: Handle non-linear core numbers
     // FIXME: Handle CPU hotplug
@@ -827,6 +877,14 @@ error_thread_create:
 error_thread_alloc:
     bperf_dbuffer_fini(&DBUFFER);
 error_dbuffer:
+    sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);
+error_perf_ver_attr:
+    sysfs_remove_file(STATE.kobj, &num_fixed_attr.attr);
+error_fixed_attr:
+    sysfs_remove_file(STATE.kobj, &num_pmc_attr.attr);
+error_pmc_attr:
+    kobject_put(STATE.kobj);
+error_kobj:
     cdev_del(&STATE.cdev);
 error_cdev:
     device_destroy(STATE.class, STATE.dev);
@@ -852,6 +910,10 @@ static void __exit bperf_exit(void)
     }
     kvfree(STATE.thread_ptr);
     bperf_dbuffer_fini(&DBUFFER);
+    sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);
+    sysfs_remove_file(STATE.kobj, &num_fixed_attr.attr);
+    sysfs_remove_file(STATE.kobj, &num_pmc_attr.attr);
+    kobject_put(STATE.kobj);
     cdev_del(&STATE.cdev);
     device_destroy(STATE.class, STATE.dev);
     class_destroy(STATE.class);
