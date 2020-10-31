@@ -86,13 +86,13 @@ static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, c
     return sprintf(buf, enabled ? "enabled\n" : "disabled\n");
 }
 static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
-    if (!strncmp(buf, "enabled", count)) {
+    if (!strncmp(buf, "enable", 6)) {
         enabled = true;
         wake_up_interruptible(&ENABLED_WQ);
-        return 7;
-    } else if (!strncmp(buf, "disabled", count)) {
+        return count;
+    } else if (!strncmp(buf, "disable", 7)) {
         enabled = false;
-        return 8;
+        return count;
     } else {
         return -EINVAL;
     }
@@ -783,6 +783,9 @@ static int bperf_thread_function(void *arg_thread_id)
         if (!enabled) {
             bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl & GLOBAL_CTRL_RESERVED);
             wait_event_interruptible(ENABLED_WQ, kthread_should_stop() || enabled);
+            if (kthread_should_stop()) {
+                break;
+            }
             bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
         }
         msleep(BPERF_MSLEEP);
