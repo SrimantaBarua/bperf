@@ -47,30 +47,57 @@
  */
 static volatile uint32_t num_pmc = 0;
 
-static ssize_t num_pmc_attr_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, "%u", num_pmc);
+static ssize_t num_pmc_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", num_pmc);
 }
-static struct kobj_attribute num_pmc_attr = __ATTR(num_pmc, 0660, num_pmc_attr_show, NULL);
+static struct kobj_attribute num_pmc_attr = __ATTR_RO(num_pmc);
 
 /**
  * @brief Number of fixed function performance monitoring counters
  */
 static volatile uint32_t num_fixed = 0;
 
-static ssize_t num_fixed_attr_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, "%u", num_fixed);
+static ssize_t num_fixed_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", num_fixed);
 }
-static struct kobj_attribute num_fixed_attr = __ATTR(num_fixed, 0660, num_fixed_attr_show, NULL);
+static struct kobj_attribute num_fixed_attr = __ATTR_RO(num_fixed);
 
 /**
  * @brief Version ID of architectural performance monitoring
  */
 static volatile uint32_t arch_perf_ver = 0;
 
-static ssize_t arch_perf_ver_attr_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, "%u", arch_perf_ver);
+static ssize_t arch_perf_ver_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", arch_perf_ver);
 }
-static struct kobj_attribute arch_perf_ver_attr = __ATTR(arch_perf_ver, 0660, arch_perf_ver_attr_show, NULL);
+static struct kobj_attribute arch_perf_ver_attr = __ATTR_RO(arch_perf_ver);
+
+/**
+ * @brief Whether performance monitoring is enabled
+ */
+static volatile bool enabled = false;
+
+/**
+ * @brief Waitqueue for performance monitoring threads
+ */
+static DECLARE_WAIT_QUEUE_HEAD(ENABLED_WQ);
+
+static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, enabled ? "enabled\n" : "disabled\n");
+}
+static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+    if (!strncmp(buf, "enabled", count)) {
+        enabled = true;
+        wake_up_interruptible(&ENABLED_WQ);
+        return 7;
+    } else if (!strncmp(buf, "disabled", count)) {
+        enabled = false;
+        return 8;
+    } else {
+        return -EINVAL;
+    }
+}
+static struct kobj_attribute enabled_attr = __ATTR_RW(enabled);
 
 // ======== MSRs, hardware counters ========
 
@@ -238,6 +265,23 @@ static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
 }
 
 /**
+ * @brief Free memory for buffer without reinitializing the mutex etc.
+ */
+static void bperf_sbuffer_clear(struct bperf_sbuffer *sbuffer) {
+    struct list_head *next, *node;
+    mutex_lock_interruptible(&sbuffer->mutex);
+    sbuffer->size = 0;
+    node = sbuffer->list.next;
+    while (node != &sbuffer->list) {
+        next = node->next;
+        bperf_sbuffer_node_free(container_of(node, struct bperf_sbuffer_node, list));
+        node = next;
+    }
+    INIT_LIST_HEAD(&sbuffer->list);
+    mutex_unlock(&sbuffer->mutex);
+}
+
+/**
  * @brief Free memory for buffer
  */
 static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
@@ -251,6 +295,7 @@ static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
         node = next;
     }
     mutex_unlock(&sbuffer->mutex);
+    mutex_destroy(&sbuffer->mutex);
 }
 
 /**
@@ -518,16 +563,22 @@ static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t t
         return;
     }
     printk(KERN_INFO "bperf: Thread %lu check-in start\n", thread_id);
-    wait_event_interruptible(BPERF_WQ, kthread_should_stop() || !dbuffer->checked_in[thread_id]);
-    if (kthread_should_stop()) {
-        return;
+    if (dbuffer->checked_in[thread_id]) {
+        wait_event_interruptible(BPERF_WQ, kthread_should_stop() || !dbuffer->checked_in[thread_id]);
+        if (kthread_should_stop()) {
+            return;
+        }
     }
     printk(KERN_INFO "bperf: Thread %lu check-in done: checked_in: %d: atomic: %u\n", thread_id, dbuffer->checked_in[thread_id], atomic_read(&dbuffer->to_check_in));
     dbuffer->checked_in[thread_id] = true;
 
     if (atomic_dec_and_test(&dbuffer->to_check_in)) {
         printk(KERN_INFO "bperf: Thread %lu writing to sbuffer\n", thread_id);
-        bperf_dbuffer_to_string(dbuffer, thread_id);
+        if (enabled) {
+            bperf_dbuffer_to_string(dbuffer, thread_id);
+        } else {
+            bperf_sbuffer_clear(&SBUFFER);
+        }
         atomic_set(&dbuffer->to_check_in, dbuffer->num_threads);
         memset(dbuffer->checked_in, 0, dbuffer->num_threads * sizeof(bool));
         wake_up_interruptible(&BPERF_WQ);
@@ -724,9 +775,16 @@ static int bperf_thread_function(void *arg_thread_id)
     bperf_wrmsr(MSR_FIXED_CTR_CTRL, w);
 
     // Enable performance monitoring
-    bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
+    if (enabled) {
+        bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
+    }
 
     while (!kthread_should_stop()) {
+        if (!enabled) {
+            bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl & GLOBAL_CTRL_RESERVED);
+            wait_event_interruptible(ENABLED_WQ, kthread_should_stop() || enabled);
+            bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
+        }
         msleep(BPERF_MSLEEP);
         thread_state->timestamp = ktime_get_ns();
         printk(KERN_INFO "bperf: Thread function: %u, ts: %#llx\n", smp_processor_id(), thread_state->timestamp);
@@ -837,6 +895,10 @@ static int __init bperf_init(void)
         printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
         goto error_perf_ver_attr;
     }
+    if ((ret = sysfs_create_file(STATE.kobj, &enabled_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_enabled_attr;
+    }
 
     // Allocate buffers for all threads
     // FIXME: Handle non-linear core numbers
@@ -877,6 +939,8 @@ error_thread_create:
 error_thread_alloc:
     bperf_dbuffer_fini(&DBUFFER);
 error_dbuffer:
+    sysfs_remove_file(STATE.kobj, &enabled_attr.attr);
+error_enabled_attr:
     sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);
 error_perf_ver_attr:
     sysfs_remove_file(STATE.kobj, &num_fixed_attr.attr);
