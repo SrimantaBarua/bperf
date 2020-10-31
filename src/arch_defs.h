@@ -124,13 +124,13 @@
     __BPERF_PER_EVENT(ITLB_MISSES, WALK_PENDING) \
     __BPERF_PER_EVENT(ITLB_MISSES, WALK_ACTIVE) \
     __BPERF_PER_EVENT(ITLB_MISSES, STLB_HIT)
+/* TODO: Add more events */
 
 /**
  * @brief Standardized event IDs
  */
 enum bperf_event_id {
     NONE = 0,
-
 #define __BPERF_PER_EVENT(x, y) x ## _ ## y ,
     __BPERF_DO_FOR_EACH_EVENT
 #undef __BPERF_PER_EVENT
@@ -139,7 +139,7 @@ enum bperf_event_id {
 /**
  * @brief Get integer event ID for event name. 0 on failure
  */
-enum bperf_event_id bperf_get_event_id(const char *name);
+enum bperf_event_id bperf_get_event_id(const char *name, size_t len);
 
 /**
  * @brief Get string name for event ID

@@ -25,6 +25,8 @@
 #include <linux/wait.h>
 #include <asm/smp.h>
 
+#include "arch_defs.h"
+
 #define BPERF_NAME      "bperf"
 #define BPERF_LICENSE   "GPL"
 #define BPERF_AUTHOR    "Srimanta Barua <srimanta.barua1@gmail.com>"
@@ -143,12 +145,13 @@ static struct bperf_state {
     size_t             num_threads;  /* Number of threads we spawned */
     struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
     /* Performance monitoring capabilities */
-    bool     enabled;       /* Whether performance monitoring is enabled */
-    uint32_t arch_perf_ver; /* Version ID of architectural performance monitoring */
-    uint32_t num_pmc;       /* Number of general purpose performance monitoring counters */
-    uint32_t num_fixed;     /* Number of fixed function performance monitoring counters */
-    uint32_t ctr_width;     /* Bit width of general purpose counters */
-    uint32_t fix_ctr_width; /* Bit width of fixed function counters */
+    bool                enabled;               /* Whether performance monitoring is enabled */
+    uint32_t            arch_perf_ver;         /* Version ID of architectural performance monitoring */
+    uint32_t            num_pmc;               /* Number of general purpose performance monitoring counters */
+    uint32_t            num_fixed;             /* Number of fixed function performance monitoring counters */
+    uint32_t            ctr_width;             /* Bit width of general purpose counters */
+    uint32_t            fix_ctr_width;         /* Bit width of fixed function counters */
+    enum bperf_event_id pmc_id[BPERF_MAX_PMC]; /* Configured event for each PMC */
     /* Whether specific events are available */
     bool ev_core_cycle;        /* Core cycle event available */
     bool ev_inst_retired;      /* Instruction retired event available */
@@ -195,10 +198,93 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr, 
     }
 }
 
+static ssize_t pmc0_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[0]));
+}
+
+static ssize_t pmc0_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+    enum bperf_event_id id;
+    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
+    if (STATE.enabled) {
+        return -EBUSY;
+    }
+    id = bperf_get_event_id(buf, count);
+    if (id == 0) {
+        return -EINVAL;
+    } else {
+        STATE.pmc_id[0] = id;
+        return count;
+    }
+}
+
+static ssize_t pmc1_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[1]));
+}
+
+static ssize_t pmc1_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+    enum bperf_event_id id;
+    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
+    if (STATE.enabled) {
+        return -EBUSY;
+    }
+    id = bperf_get_event_id(buf, count);
+    if (id == 0) {
+        return -EINVAL;
+    } else {
+        STATE.pmc_id[1] = id;
+        return count;
+    }
+}
+
+static ssize_t pmc2_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[2]));
+}
+
+static ssize_t pmc2_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+    enum bperf_event_id id;
+    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
+    if (STATE.enabled) {
+        return -EBUSY;
+    }
+    id = bperf_get_event_id(buf, count);
+    if (id == 0) {
+        return -EINVAL;
+    } else {
+        STATE.pmc_id[2] = id;
+        return count;
+    }
+}
+
+static ssize_t pmc3_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[3]));
+}
+
+static ssize_t pmc3_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+    enum bperf_event_id id;
+    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
+    if (STATE.enabled) {
+        return -EBUSY;
+    }
+    id = bperf_get_event_id(buf, count);
+    if (id == 0) {
+        return -EINVAL;
+    } else {
+        STATE.pmc_id[3] = id;
+        return count;
+    }
+}
+
 static struct kobj_attribute num_pmc_attr       = __ATTR_RO(num_pmc);
 static struct kobj_attribute num_fixed_attr     = __ATTR_RO(num_fixed);
 static struct kobj_attribute arch_perf_ver_attr = __ATTR_RO(arch_perf_ver);
 static struct kobj_attribute enabled_attr       = __ATTR_RW(enabled);
+// TODO: Align with BPERF_MAX_PMC
+static struct kobj_attribute pmc_attrs[] = {
+    __ATTR_RW(pmc0),
+    __ATTR_RW(pmc1),
+    __ATTR_RW(pmc2),
+    __ATTR_RW(pmc3),
+};
 
 // ======== String buffer ========
 
@@ -554,7 +640,7 @@ static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread
     bperf_snprintf("\n"); \
 } while (0)
 
-    // FIXME: Align with BPERF_MAX_FIXED and BPERF_MAX_PMC
+    // TODO: Align with BPERF_MAX_FIXED and BPERF_MAX_PMC
     write_x(pmc[0]);
     write_x(pmc[1]);
     write_x(pmc[2]);
@@ -819,12 +905,12 @@ static int bperf_thread_function(void *arg_thread_id)
 static int __init bperf_init(void)
 {
     int ret;
-    size_t i;
+    size_t i, j;
 
     printk(KERN_INFO "bperf: Loading...\n");
     bperf_identify_processor();
     bperf_get_arch_perfmon_capabilities();
-    if (STATE.arch_perf_ver < BPERF_MIN_ARCH) {
+    if (STATE.arch_perf_ver < BPERF_MIN_ARCH || STATE.num_pmc == 0) {
         printk(KERN_ALERT "bperf: Not enough support for performance monitoring\n");
         return -1;
     }
@@ -890,6 +976,12 @@ static int __init bperf_init(void)
         printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
         goto error_enabled_attr;
     }
+    for (j = 0; j < STATE.num_pmc; j++) {
+        if ((ret = sysfs_create_file(STATE.kobj, &pmc_attrs[j].attr))) {
+            printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+            goto error_pmc_attrs;
+        }
+    }
 
     // Allocate buffers for all threads
     // FIXME: Handle non-linear core numbers
@@ -930,6 +1022,11 @@ error_thread_create:
 error_thread_alloc:
     bperf_dbuffer_fini(&DBUFFER);
 error_dbuffer:
+    j = STATE.num_pmc - 1;
+error_pmc_attrs:
+    for (i = 0; i <= j; i++) {
+        sysfs_remove_file(STATE.kobj, &pmc_attrs[i].attr);
+    }
     sysfs_remove_file(STATE.kobj, &enabled_attr.attr);
 error_enabled_attr:
     sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);
@@ -965,6 +1062,10 @@ static void __exit bperf_exit(void)
     }
     kvfree(STATE.thread_ptr);
     bperf_dbuffer_fini(&DBUFFER);
+    for (i = 0; i < STATE.num_pmc; i++) {
+        sysfs_remove_file(STATE.kobj, &pmc_attrs[i].attr);
+    }
+    sysfs_remove_file(STATE.kobj, &enabled_attr.attr);
     sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);
     sysfs_remove_file(STATE.kobj, &num_fixed_attr.attr);
     sysfs_remove_file(STATE.kobj, &num_pmc_attr.attr);

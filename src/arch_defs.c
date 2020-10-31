@@ -13,32 +13,26 @@
 /**
  * @brief Get integer event ID for event name. 0 on failure
  */
-enum bperf_event_id bperf_get_event_id(const char *name) {
-
+enum bperf_event_id bperf_get_event_id(const char *name, size_t len)
+{
 #define __BPERF_PER_EVENT(x, y) do { \
-    if (!strcmp(name, #x "." #y)) { \
+    if (!strncmp(name, #x "." #y, len)) { \
         return x ## _ ## y; \
     } \
 } while (0);
-
     __BPERF_DO_FOR_EACH_EVENT
-
 #undef __BPERF_PER_EVENT
-
     return 0;
 }
 
-const char* bperf_get_event_name(enum bperf_event_id id) {
-
+const char* bperf_get_event_name(enum bperf_event_id id)
+{
 #define __BPERF_PER_EVENT(x, y) case x ## _ ## y : return #x "." #y;
-
     switch (id) {
         __BPERF_DO_FOR_EACH_EVENT
-
         default:
             return "__UNKNOWN__";
     }
-
 #undef __BPERF_PER_EVENT
 }
 
@@ -218,7 +212,8 @@ static struct bperf_arch_events EVENTS[] = {
 /**
  * @brief Get architecture-specific description of event
  */
-const struct bperf_event* bperf_get_arch_event(enum bperf_event_id id, uint8_t family, uint8_t model) {
+const struct bperf_event* bperf_get_arch_event(enum bperf_event_id id, uint8_t family, uint8_t model)
+{
     size_t evi, archi, n_archs = sizeof(EVENTS) / sizeof(EVENTS[0]);
     for (archi = 0; archi < n_archs; archi++) {
         if (EVENTS[archi].family != family || EVENTS[archi].model != model) {
