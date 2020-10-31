@@ -40,65 +40,6 @@
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
-// ======== Module state (available to userspace) ========
-
-/**
- * @brief Number of general purpose performance monitoring counters
- */
-static volatile uint32_t num_pmc = 0;
-
-static ssize_t num_pmc_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, "%u\n", num_pmc);
-}
-static struct kobj_attribute num_pmc_attr = __ATTR_RO(num_pmc);
-
-/**
- * @brief Number of fixed function performance monitoring counters
- */
-static volatile uint32_t num_fixed = 0;
-
-static ssize_t num_fixed_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, "%u\n", num_fixed);
-}
-static struct kobj_attribute num_fixed_attr = __ATTR_RO(num_fixed);
-
-/**
- * @brief Version ID of architectural performance monitoring
- */
-static volatile uint32_t arch_perf_ver = 0;
-
-static ssize_t arch_perf_ver_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, "%u\n", arch_perf_ver);
-}
-static struct kobj_attribute arch_perf_ver_attr = __ATTR_RO(arch_perf_ver);
-
-/**
- * @brief Whether performance monitoring is enabled
- */
-static volatile bool enabled = false;
-
-/**
- * @brief Waitqueue for performance monitoring threads
- */
-static DECLARE_WAIT_QUEUE_HEAD(ENABLED_WQ);
-
-static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, enabled ? "enabled\n" : "disabled\n");
-}
-static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
-    if (!strncmp(buf, "enable", 6)) {
-        enabled = true;
-        wake_up_interruptible(&ENABLED_WQ);
-        return count;
-    } else if (!strncmp(buf, "disable", 7)) {
-        enabled = false;
-        return count;
-    } else {
-        return -EINVAL;
-    }
-}
-static struct kobj_attribute enabled_attr = __ATTR_RW(enabled);
-
 // ======== MSRs, hardware counters ========
 
 /* MSR numbers */
@@ -186,6 +127,79 @@ static void bperf_cpuid(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *e
     __asm__("cpuid\n" : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx) : "a"(*eax), "c"(*ecx) : );
 }
 
+// ======== Module state ==========
+
+/**
+ * @brief Global module state
+ */
+static struct bperf_state {
+    /* Kernel state */
+    dev_t          dev;     /* Stores the device number */
+    struct class   *class;  /* The device-driver class struct */
+    struct device  *device; /* The device-driver device struct */
+    struct cdev    cdev;    /* Char device structure */
+    struct kobject *kobj;   /* Kernel object for sysfs */
+    /* Module information */
+    size_t             num_threads;  /* Number of threads we spawned */
+    struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
+    /* Performance monitoring capabilities */
+    bool     enabled;       /* Whether performance monitoring is enabled */
+    uint32_t arch_perf_ver; /* Version ID of architectural performance monitoring */
+    uint32_t num_pmc;       /* Number of general purpose performance monitoring counters */
+    uint32_t num_fixed;     /* Number of fixed function performance monitoring counters */
+    uint32_t ctr_width;     /* Bit width of general purpose counters */
+    uint32_t fix_ctr_width; /* Bit width of fixed function counters */
+    /* Whether specific events are available */
+    bool ev_core_cycle;        /* Core cycle event available */
+    bool ev_inst_retired;      /* Instruction retired event available */
+    bool ev_ref_cycles;        /* Reference cycles event available */
+    bool ev_llc_ref;           /* LLC reference event available */
+    bool ev_llc_miss;          /* LLC miss event available */
+    bool ev_branch_retired;    /* Branch instruction retired event available */
+    bool ev_branch_mispredict; /* Branch mispredict retired event available */
+} STATE = { 0 };
+
+/**
+ * @brief Waitqueue for performance monitoring threads
+ */
+static DECLARE_WAIT_QUEUE_HEAD(ENABLED_WQ);
+
+// ======== Userspace-visible module state ========
+
+static ssize_t num_pmc_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", STATE.num_pmc);
+}
+
+static ssize_t num_fixed_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", STATE.num_fixed);
+}
+
+static ssize_t arch_perf_ver_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", STATE.arch_perf_ver);
+}
+
+static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, STATE.enabled ? "enabled\n" : "disabled\n");
+}
+
+static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+    if (!strncmp(buf, "enable", 6)) {
+        STATE.enabled = true;
+        wake_up_interruptible(&ENABLED_WQ);
+        return count;
+    } else if (!strncmp(buf, "disable", 7)) {
+        STATE.enabled = false;
+        return count;
+    } else {
+        return -EINVAL;
+    }
+}
+
+static struct kobj_attribute num_pmc_attr       = __ATTR_RO(num_pmc);
+static struct kobj_attribute num_fixed_attr     = __ATTR_RO(num_fixed);
+static struct kobj_attribute arch_perf_ver_attr = __ATTR_RO(arch_perf_ver);
+static struct kobj_attribute enabled_attr       = __ATTR_RW(enabled);
+
 // ======== String buffer ========
 
 #define BPERF_SBUFFER_BLK_SZ    2048
@@ -240,7 +254,7 @@ static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node)
 /**
  * @brief Circular buffer to write data to
  */
-struct bperf_sbuffer {
+static struct bperf_sbuffer {
     struct list_head  list;  /* Head node to linked list of buffers */
     struct mutex      mutex; /* Mutex for access to the buffer */
     size_t            size;  /* Amount of data currently in buffer */
@@ -481,7 +495,7 @@ struct bperf_dbuffer_thread {
 /**
  * @brief A variable-sized data node for a single timestamp
  */
-struct bperf_dbuffer {
+static struct bperf_dbuffer {
     size_t                      num_threads; /* Number of threads */
     atomic_t                    to_check_in; /* Number of threads to check in */
     bool                        *checked_in; /* Whether the given thread has checked in its data */
@@ -574,7 +588,7 @@ static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t t
 
     if (atomic_dec_and_test(&dbuffer->to_check_in)) {
         printk(KERN_INFO "bperf: Thread %lu writing to sbuffer\n", thread_id);
-        if (enabled) {
+        if (STATE.enabled) {
             bperf_dbuffer_to_string(dbuffer, thread_id);
         } else {
             bperf_sbuffer_clear(&SBUFFER);
@@ -585,33 +599,7 @@ static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t t
     }
 }
 
-// ======== Module logic ==========
-
-/**
- * @brief Global module state
- */
-static struct bperf_state {
-    /* Kernel state */
-    dev_t          dev;     /* Stores the device number */
-    struct class   *class;  /* The device-driver class struct */
-    struct device  *device; /* The device-driver device struct */
-    struct cdev    cdev;    /* Char device structure */
-    struct kobject *kobj;   /* Kernel object for sysfs */
-    /* Module information */
-    size_t             num_threads;  /* Number of threads we spawned */
-    struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
-    /* Performance monitoring capabilities */
-    uint32_t ctr_width;     /* Bit width of general purpose counters */
-    uint32_t fix_ctr_width; /* Bit width of fixed function counters */
-    /* Whether specific events are available */
-    bool ev_core_cycle;        /* Core cycle event available */
-    bool ev_inst_retired;      /* Instruction retired event available */
-    bool ev_ref_cycles;        /* Reference cycles event available */
-    bool ev_llc_ref;           /* LLC reference event available */
-    bool ev_llc_miss;          /* LLC miss event available */
-    bool ev_branch_retired;    /* Branch instruction retired event available */
-    bool ev_branch_mispredict; /* Branch mispredict retired event available */
-} STATE = { 0 };
+// ======== Module logic ========
 
 /**
  * @brief Dummy llseek function. Basically we don't support seeking
@@ -690,11 +678,11 @@ static void bperf_get_arch_perfmon_capabilities(void)
     uint32_t eax = 0x0a, ebx = 0, ecx = 0, edx = 0, bvsz;
     bperf_cpuid(&eax, &ebx, &ecx, &edx);
 
-    arch_perf_ver   = eax & 0xff;
-    num_pmc         = (eax >> 8) & 0xff;
-    num_pmc         = MIN(num_pmc, BPERF_MAX_PMC);
-    STATE.ctr_width = (eax >> 16) & 0xff;
-    bvsz            = (eax >> 24) & 0xff;
+    STATE.arch_perf_ver = eax & 0xff;
+    STATE.num_pmc       = (eax >> 8) & 0xff;
+    STATE.num_pmc       = MIN(STATE.num_pmc, BPERF_MAX_PMC);
+    STATE.ctr_width     = (eax >> 16) & 0xff;
+    bvsz                = (eax >> 24) & 0xff;
 
     STATE.ev_core_cycle        = bvsz > 0 && !(ebx & (1 << 0));
     STATE.ev_inst_retired      = bvsz > 1 && !(ebx & (1 << 1));
@@ -704,9 +692,9 @@ static void bperf_get_arch_perfmon_capabilities(void)
     STATE.ev_branch_retired    = bvsz > 5 && !(ebx & (1 << 5));
     STATE.ev_branch_mispredict = bvsz > 6 && !(ebx & (1 << 6));
 
-    if (arch_perf_ver > 1) {
-        num_fixed           = edx & 0x1f;
-        num_fixed           = MIN(num_fixed, BPERF_MAX_FIXED);
+    if (STATE.arch_perf_ver > 1) {
+        STATE.num_fixed     = edx & 0x1f;
+        STATE.num_fixed     = MIN(STATE.num_fixed, BPERF_MAX_FIXED);
         STATE.fix_ctr_width = (edx >> 5) & 0xff;
     }
 
@@ -715,10 +703,10 @@ static void bperf_get_arch_perfmon_capabilities(void)
              "       core cycles: %u, inst ret: %u, ref cycles: %u, llc ref: %u,"
              " llc miss: %u, branch ret: %u, branch mispredict: %u\n"
              "       num fixed ctr: %u, fix ctr size: %u\n",
-             arch_perf_ver, num_pmc, STATE.ctr_width, ebx, STATE.ev_core_cycle,
-             STATE.ev_inst_retired, STATE.ev_ref_cycles, STATE.ev_llc_miss,
-             STATE.ev_llc_miss, STATE.ev_branch_retired, STATE.ev_branch_mispredict,
-             num_fixed, STATE.fix_ctr_width);
+             STATE.arch_perf_ver, STATE.num_pmc, STATE.ctr_width, ebx, STATE.ev_core_cycle,
+             STATE.ev_inst_retired, STATE.ev_ref_cycles, STATE.ev_llc_miss, STATE.ev_llc_miss,
+             STATE.ev_branch_retired, STATE.ev_branch_mispredict, STATE.num_fixed,
+             STATE.fix_ctr_width);
 }
 
 /**
@@ -749,10 +737,10 @@ static int bperf_thread_function(void *arg_thread_id)
     bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
 
     // Get current state of PERFEVTSEL and PMC MSR. Set counting as enabled
-    for (i = 0; i < num_pmc; i++) {
+    for (i = 0; i < STATE.num_pmc; i++) {
         w = thread_state->perfevtsel_bak[i] = bperf_rdmsr(MSR_PERFEVTSEL(i));
         w &= PERFEVTSEL_RESERVED;
-        if (arch_perf_ver >= 3) {
+        if (STATE.arch_perf_ver >= 3) {
             w &= ~PERFEVTSEL_FLAG_ANYTHRD;
         }
         w |= PERFEVTSEL_FLAGS_SANE | pmc_events[i];
@@ -766,7 +754,7 @@ static int bperf_thread_function(void *arg_thread_id)
     // Get current state of fixed counters
     w = thread_state->fixed_ctrl_bak = bperf_rdmsr(MSR_FIXED_CTR_CTRL);
     w &= FIXED_CTRL_RESERVED;
-    for (i = 0; i < num_fixed; i++) {
+    for (i = 0; i < STATE.num_fixed; i++) {
         w |= FIXED_CTRL_EN(i);
         ctrl |= GLOBAL_CTRL_FIXED(i);
         thread_state->last_fixed[i] = bperf_rdmsr(MSR_FIXED_CTR(i));
@@ -775,14 +763,14 @@ static int bperf_thread_function(void *arg_thread_id)
     bperf_wrmsr(MSR_FIXED_CTR_CTRL, w);
 
     // Enable performance monitoring
-    if (enabled) {
+    if (STATE.enabled) {
         bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
     }
 
     while (!kthread_should_stop()) {
-        if (!enabled) {
+        if (!STATE.enabled) {
             bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl & GLOBAL_CTRL_RESERVED);
-            wait_event_interruptible(ENABLED_WQ, kthread_should_stop() || enabled);
+            wait_event_interruptible(ENABLED_WQ, kthread_should_stop() || STATE.enabled);
             if (kthread_should_stop()) {
                 break;
             }
@@ -791,7 +779,7 @@ static int bperf_thread_function(void *arg_thread_id)
         msleep(BPERF_MSLEEP);
         thread_state->timestamp = ktime_get_ns();
         printk(KERN_INFO "bperf: Thread function: %u, ts: %#llx\n", smp_processor_id(), thread_state->timestamp);
-        for (i = 0; i < num_pmc; i++) {
+        for (i = 0; i < STATE.num_pmc; i++) {
             r = bperf_rdmsr(MSR_PMC(i));
             if (r < thread_state->last_pmc[i]) {
                 thread_state->pmc[i] = 0;
@@ -800,7 +788,7 @@ static int bperf_thread_function(void *arg_thread_id)
             }
             thread_state->last_pmc[i] = r;
         }
-        for (i = 0; i < num_fixed; i++) {
+        for (i = 0; i < STATE.num_fixed; i++) {
             r = bperf_rdmsr(MSR_FIXED_CTR(i));
             if (r < thread_state->last_fixed[i]) {
                 thread_state->fixed[i] = 0;
@@ -816,7 +804,7 @@ static int bperf_thread_function(void *arg_thread_id)
     ctrl = bperf_rdmsr(MSR_PERF_GLOBAL_CTRL);
     ctrl &= GLOBAL_CTRL_RESERVED;
     bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
-    for (i = 0; i < num_pmc; i++) {
+    for (i = 0; i < STATE.num_pmc; i++) {
         bperf_wrmsr(MSR_PERFEVTSEL(i), thread_state->perfevtsel_bak[i]);
     }
     bperf_wrmsr(MSR_FIXED_CTR_CTRL, thread_state->fixed_ctrl_bak);
@@ -836,7 +824,7 @@ static int __init bperf_init(void)
     printk(KERN_INFO "bperf: Loading...\n");
     bperf_identify_processor();
     bperf_get_arch_perfmon_capabilities();
-    if (arch_perf_ver < BPERF_MIN_ARCH) {
+    if (STATE.arch_perf_ver < BPERF_MIN_ARCH) {
         printk(KERN_ALERT "bperf: Not enough support for performance monitoring\n");
         return -1;
     }
