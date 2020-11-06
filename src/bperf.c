@@ -67,11 +67,29 @@
 #define PERFEVTSEL_BRANCH_MISS 0x00c5UL
 /* Architectural performance monitoring flags */
 #define PERFEVTSEL_RESERVED     0xffffffff00280000UL
-#define PERFEVTSEL_FLAG_USR     0x10000UL
-#define PERFEVTSEL_FLAG_OS      0x20000UL
+#define PERFEVTSEL_CMASK(x)     (((uint64_t) (x) & 0xff) << 24)
+#define PERFEVTSEL_UMASK(x)     (((uint64_t) (x) & 0xff) << 8)
+#define PERFEVTSEL_EVSEL(x)     ((uint64_t) (x) & 0xff)
+#define PERFEVTSEL_FLAG_USR     0x010000UL
+#define PERFEVTSEL_FLAG_OS      0x020000UL
+#define PERFEVTSEL_FLAG_EDGE    0x040000UL
+#define PERFEVTSEL_FLAG_PC      0x080000UL
+#define PERFEVTSEL_FLAG_INT     0x100000UL
 #define PERFEVTSEL_FLAG_ANYTHRD 0x200000UL
 #define PERFEVTSEL_FLAG_ENABLE  0x400000UL
-#define PERFEVTSEL_FLAGS_SANE   (PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_ENABLE)
+#define PERFEVTSEL_FLAG_INV     0x800000UL
+
+static inline uint64_t perfevtsel_from_ev(const struct bperf_event *e) {
+    uint64_t ret;
+    ret = PERFEVTSEL_CMASK(e->cmask) | PERFEVTSEL_UMASK(e->umask) | PERFEVTSEL_EVSEL(e->ev_num);
+    if (e->inv) {
+        ret |= PERFEVTSEL_FLAG_INV;
+    }
+    if (e->edge) {
+        ret |= PERFEVTSEL_FLAG_EDGE;
+    }
+    return ret;
+}
 
 /* Fixed counter ctrl */
 #define FIXED_CTRL_RESERVED 0xfffffffffffff000UL
@@ -141,17 +159,19 @@ static struct bperf_state {
     struct device  *device; /* The device-driver device struct */
     struct cdev    cdev;    /* Char device structure */
     struct kobject *kobj;   /* Kernel object for sysfs */
+    /* System information */
+    uint32_t family; /* Display_Family */
+    uint32_t model;  /* Display_Model */
     /* Module information */
     size_t             num_threads;  /* Number of threads we spawned */
     struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
     /* Performance monitoring capabilities */
-    bool                enabled;               /* Whether performance monitoring is enabled */
-    uint32_t            arch_perf_ver;         /* Version ID of architectural performance monitoring */
-    uint32_t            num_pmc;               /* Number of general purpose performance monitoring counters */
-    uint32_t            num_fixed;             /* Number of fixed function performance monitoring counters */
-    uint32_t            ctr_width;             /* Bit width of general purpose counters */
-    uint32_t            fix_ctr_width;         /* Bit width of fixed function counters */
-    enum bperf_event_id pmc_id[BPERF_MAX_PMC]; /* Configured event for each PMC */
+    bool                enabled;       /* Whether performance monitoring is enabled */
+    uint32_t            arch_perf_ver; /* Version ID of architectural performance monitoring */
+    uint32_t            num_pmc;       /* Number of general purpose performance monitoring counters */
+    uint32_t            num_fixed;     /* Number of fixed function performance monitoring counters */
+    uint32_t            ctr_width;     /* Bit width of general purpose counters */
+    uint32_t            fix_ctr_width; /* Bit width of fixed function counters */
     /* Whether specific events are available */
     bool ev_core_cycle;        /* Core cycle event available */
     bool ev_inst_retired;      /* Instruction retired event available */
@@ -160,6 +180,8 @@ static struct bperf_state {
     bool ev_llc_miss;          /* LLC miss event available */
     bool ev_branch_retired;    /* Branch instruction retired event available */
     bool ev_branch_mispredict; /* Branch mispredict retired event available */
+    /* Performance monitoring state */
+    enum bperf_event_id pmc_id[BPERF_MAX_PMC]; /* Configured event for each PMC */
 } STATE = { 0 };
 
 /**
@@ -186,11 +208,14 @@ static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, c
 }
 
 static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
-    if (!strncmp(buf, "enable", 6)) {
+    while (count > 0 && buf[count - 1] == '\n') {
+        count--;
+    }
+    if (!strncmp(buf, "enable", count)) {
         STATE.enabled = true;
         wake_up_interruptible(&ENABLED_WQ);
         return count;
-    } else if (!strncmp(buf, "disable", 7)) {
+    } else if (!strncmp(buf, "disable", count)) {
         STATE.enabled = false;
         return count;
     } else {
@@ -199,17 +224,19 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr, 
 }
 
 static ssize_t pmc0_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[0]));
+    return sprintf(buf, "%s\n", bperf_get_event_name(STATE.pmc_id[0]));
 }
 
 static ssize_t pmc0_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
     enum bperf_event_id id;
-    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
     if (STATE.enabled) {
         return -EBUSY;
     }
+    while (count > 0 && buf[count - 1] == '\n') {
+        count--;
+    }
     id = bperf_get_event_id(buf, count);
-    if (id == 0) {
+    if (id == __UNKNOWN_EVENT__) {
         return -EINVAL;
     } else {
         STATE.pmc_id[0] = id;
@@ -218,17 +245,19 @@ static ssize_t pmc0_store(struct kobject *kobj, struct kobj_attribute *attr, con
 }
 
 static ssize_t pmc1_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[1]));
+    return sprintf(buf, "%s\n", bperf_get_event_name(STATE.pmc_id[1]));
 }
 
 static ssize_t pmc1_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
     enum bperf_event_id id;
-    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
     if (STATE.enabled) {
         return -EBUSY;
     }
+    while (count > 0 && buf[count - 1] == '\n') {
+        count--;
+    }
     id = bperf_get_event_id(buf, count);
-    if (id == 0) {
+    if (id == __UNKNOWN_EVENT__) {
         return -EINVAL;
     } else {
         STATE.pmc_id[1] = id;
@@ -237,17 +266,19 @@ static ssize_t pmc1_store(struct kobject *kobj, struct kobj_attribute *attr, con
 }
 
 static ssize_t pmc2_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[2]));
+    return sprintf(buf, "%s\n", bperf_get_event_name(STATE.pmc_id[2]));
 }
 
 static ssize_t pmc2_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
     enum bperf_event_id id;
-    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
     if (STATE.enabled) {
         return -EBUSY;
     }
+    while (count > 0 && buf[count - 1] == '\n') {
+        count--;
+    }
     id = bperf_get_event_id(buf, count);
-    if (id == 0) {
+    if (id == __UNKNOWN_EVENT__) {
         return -EINVAL;
     } else {
         STATE.pmc_id[2] = id;
@@ -256,17 +287,19 @@ static ssize_t pmc2_store(struct kobject *kobj, struct kobj_attribute *attr, con
 }
 
 static ssize_t pmc3_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
-    return sprintf(buf, bperf_get_event_name(STATE.pmc_id[3]));
+    return sprintf(buf, "%s\n", bperf_get_event_name(STATE.pmc_id[3]));
 }
 
 static ssize_t pmc3_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
     enum bperf_event_id id;
-    printk(KERN_INFO "bperf: store: %lu: %s\n", count, buf);
     if (STATE.enabled) {
         return -EBUSY;
     }
+    while (count > 0 && buf[count - 1] == '\n') {
+        count--;
+    }
     id = bperf_get_event_id(buf, count);
-    if (id == 0) {
+    if (id == __UNKNOWN_EVENT__) {
         return -EINVAL;
     } else {
         STATE.pmc_id[3] = id;
@@ -624,31 +657,35 @@ static void bperf_dbuffer_fini(struct bperf_dbuffer *dbuffer)
  */
 static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread_id)
 {
-    size_t i;
+    size_t i, j;
     uint64_t timestamp = dbuffer->data[thread_id].timestamp;
 
     bperf_snprintf("timestamp: %llu\n", timestamp);
 
-#define write_x(X) do { \
-    bperf_snprintf(#X ": ");\
-    for (i = 0; i < dbuffer->num_threads; i++) { \
-        if (!dbuffer->data[i].has_ ## X) { \
-            continue; \
-        } \
-        bperf_snprintf("%llu ", dbuffer->data[i].X); \
-    } \
-    bperf_snprintf("\n"); \
-} while (0)
+    for (i = 0; i < STATE.num_pmc; i++) {
+        if (STATE.pmc_id[i] == DISABLED) {
+            continue;
+        }
+        bperf_snprintf("%s : ", bperf_get_event_name(STATE.pmc_id[i]));
+        for (j = 0; j < dbuffer->num_threads; j++) {
+            if (!dbuffer->data[j].has_pmc[i]) {
+                continue;
+            }
+            bperf_snprintf("%llu ", dbuffer->data[j].pmc[i]);
+        }
+        bperf_snprintf("\n");
+    }
 
-    // TODO: Align with BPERF_MAX_FIXED and BPERF_MAX_PMC
-    write_x(pmc[0]);
-    write_x(pmc[1]);
-    write_x(pmc[2]);
-    write_x(pmc[3]);
-    write_x(fixed[0]);
-    write_x(fixed[1]);
-    write_x(fixed[2]);
-    write_x(fixed[3]);
+    for (i = 0; i < STATE.num_fixed; i++) {
+        bperf_snprintf("%s : ", bperf_get_fixed_ctr_name(i));
+        for (j = 0; j < dbuffer->num_threads; j++) {
+            if (!dbuffer->data[j].has_fixed[i]) {
+                continue;
+            }
+            bperf_snprintf("%llu ", dbuffer->data[j].fixed[i]);
+        }
+        bperf_snprintf("\n");
+    }
 
     bperf_snprintf_flush();
 }
@@ -741,19 +778,19 @@ static struct file_operations bperf_fops = {
  */
 static void bperf_identify_processor(void)
 {
-    uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0, stepping, model, family, ext_model;
+    uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0, stepping, ext_model;
     bperf_cpuid(&eax, &ebx, &ecx, &edx);
     stepping = eax & 0xf;
-    model = (eax >> 4) & 0xf;
-    family = (eax >> 8) & 0xf;
-    if (family == 0x06 || family == 0x0f) {
+    STATE.model = (eax >> 4) & 0xf;
+    STATE.family = (eax >> 8) & 0xf;
+    if (STATE.family == 0x06 || STATE.family == 0x0f) {
         ext_model = (eax >> 16) & 0x0f;
-        model = (ext_model << 4) + model;
+        STATE.model = (ext_model << 4) + STATE.model;
     }
-    if (family == 0x0f) {
-        family += (eax >> 20) & 0xff;
+    if (STATE.family == 0x0f) {
+        STATE.family += (eax >> 20) & 0xff;
     }
-    printk(KERN_INFO "bperf: CPU family: %#x, model: %u, stepping: %u\n", family, model, stepping);
+    printk(KERN_INFO "bperf: CPU family: %#x, model: %u, stepping: %u\n", STATE.family, STATE.model, stepping);
 }
 
 /**
@@ -796,19 +833,37 @@ static void bperf_get_arch_perfmon_capabilities(void)
 }
 
 /**
+ * @brief Setup or disable counting on a single PMC for a single thread
+ */
+static bool bperf_thread_setup_pmc(size_t thread_id, size_t pmc_id)
+{
+    uint64_t val;
+    struct bperf_dbuffer_thread *thread_state;
+    const struct bperf_event *ev;
+
+    thread_state = &DBUFFER.data[thread_id];
+    val = thread_state->perfevtsel_bak[pmc_id];
+    val &= PERFEVTSEL_RESERVED;
+    val |= PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_USR;
+    if (STATE.arch_perf_ver >= 3) {
+        val &= ~PERFEVTSEL_FLAG_ANYTHRD;
+    }
+    if (!(ev = bperf_get_arch_event(STATE.pmc_id[pmc_id], STATE.family, STATE.model))) {
+        thread_state->has_pmc[pmc_id] = false;
+        return false;
+    }
+    val |= perfevtsel_from_ev(ev);
+    bperf_wrmsr(MSR_PERFEVTSEL(pmc_id), val);
+    thread_state->last_pmc[pmc_id] = bperf_rdmsr(MSR_PMC(pmc_id));
+    thread_state->has_pmc[pmc_id] = true;
+    return true;
+}
+
+/**
  * @brief Thread function for polling counters
  */
 static int bperf_thread_function(void *arg_thread_id)
 {
-    // The events that we want per PMC
-    // FIXME: Align with BPERF_MAX_FIXED and BPERF_MAX_PMC
-    static uint64_t pmc_events[4] = {
-        PERFEVTSEL_CORE_CYCLES,
-        PERFEVTSEL_LLC_MISS,
-        PERFEVTSEL_BRANCH_MISS,
-        PERFEVTSEL_LLC_REF
-    };
-
     uint32_t i;
     uint64_t r, w, ctrl;
     size_t thread_id;
@@ -824,17 +879,10 @@ static int bperf_thread_function(void *arg_thread_id)
 
     // Get current state of PERFEVTSEL and PMC MSR. Set counting as enabled
     for (i = 0; i < STATE.num_pmc; i++) {
-        w = thread_state->perfevtsel_bak[i] = bperf_rdmsr(MSR_PERFEVTSEL(i));
-        w &= PERFEVTSEL_RESERVED;
-        if (STATE.arch_perf_ver >= 3) {
-            w &= ~PERFEVTSEL_FLAG_ANYTHRD;
+        thread_state->perfevtsel_bak[i] = bperf_rdmsr(MSR_PERFEVTSEL(i));
+        if (bperf_thread_setup_pmc(thread_id, i)) {
+            ctrl |= GLOBAL_CTRL_PMC(i);
         }
-        w |= PERFEVTSEL_FLAGS_SANE | pmc_events[i];
-        bperf_wrmsr(MSR_PERFEVTSEL(i), w);
-        // Get current value of the PMC
-        thread_state->last_pmc[i] = bperf_rdmsr(MSR_PMC(i));
-        thread_state->has_pmc[i] = true;
-        ctrl |= GLOBAL_CTRL_PMC(i);
     }
 
     // Get current state of fixed counters
@@ -855,10 +903,19 @@ static int bperf_thread_function(void *arg_thread_id)
 
     while (!kthread_should_stop()) {
         if (!STATE.enabled) {
-            bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl & GLOBAL_CTRL_RESERVED);
+            ctrl &= GLOBAL_CTRL_RESERVED;
+            bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
             wait_event_interruptible(ENABLED_WQ, kthread_should_stop() || STATE.enabled);
             if (kthread_should_stop()) {
                 break;
+            }
+            for (i = 0; i < STATE.num_fixed; i++) {
+                ctrl |= GLOBAL_CTRL_FIXED(i);
+            }
+            for (i = 0; i < STATE.num_pmc; i++) {
+                if (bperf_thread_setup_pmc(thread_id, i)) {
+                    ctrl |= GLOBAL_CTRL_PMC(i);
+                }
             }
             bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
         }

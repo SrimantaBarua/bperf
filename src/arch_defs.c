@@ -11,6 +11,18 @@
 #include "arch_defs.h"
 
 /**
+ * @brief Get name for fixed counter
+ */
+const char* bperf_get_fixed_ctr_name(size_t i) {
+    switch (i) {
+    case 0:  return "INST_RETIRED.ANY";
+    case 1:  return "CPU_CLK_UNHALTED.THREAD";
+    case 2:  return "CPU_CLK_UNHALTED.REF_TSC";
+    default: return "__UNKNOWN_EVENT__";
+    }
+}
+
+/**
  * @brief Get integer event ID for event name. 0 on failure
  */
 enum bperf_event_id bperf_get_event_id(const char *name, size_t len)
@@ -22,16 +34,19 @@ enum bperf_event_id bperf_get_event_id(const char *name, size_t len)
 } while (0);
     __BPERF_DO_FOR_EACH_EVENT
 #undef __BPERF_PER_EVENT
-    return 0;
+    if (!strncmp(name, "DISABLED", len)) {
+        return DISABLED;
+    }
+    return __UNKNOWN_EVENT__;
 }
 
 const char* bperf_get_event_name(enum bperf_event_id id)
 {
 #define __BPERF_PER_EVENT(x, y) case x ## _ ## y : return #x "." #y;
     switch (id) {
+        case DISABLED: return "DISABLED";
         __BPERF_DO_FOR_EACH_EVENT
-        default:
-            return "__UNKNOWN__";
+        default: return "__UNKNOWN_EVENT__";
     }
 #undef __BPERF_PER_EVENT
 }
@@ -54,18 +69,14 @@ struct bperf_arch_events {
 };
 
 // Helper macros for static event definitions
-#define FIXED(num)                    { true, { .fixed_num = num } }
-#define PMC(ev, um)                   { false, { .pmc = { .ev_num = ev, .umask = um, .cmask = 0,  .inv = false, .edge = false } } }
-#define PMC_CMASK(ev, um, cm)         { false, { .pmc = { .ev_num = ev, .umask = um, .cmask = cm, .inv = false, .edge = false } } }
-#define PMC_CMASK_INV(ev, um, cm)     { false, { .pmc = { .ev_num = ev, .umask = um, .cmask = cm, .inv = true, .edge = false } } }
-#define PMC_CMASK_EDG(ev, um, cm)     { false, { .pmc = { .ev_num = ev, .umask = um, .cmask = cm, .inv = false, .edge = true } } }
-#define PMC_CMASK_INV_EDG(ev, um, cm) { false, { .pmc = { .ev_num = ev, .umask = um, .cmask = cm, .inv = true, .edge = true } } }
+#define PMC(ev, um)                   { .ev_num = ev, .umask = um, .cmask = 0,  .inv = false, .edge = false }
+#define PMC_CMASK(ev, um, cm)         { .ev_num = ev, .umask = um, .cmask = cm, .inv = false, .edge = false }
+#define PMC_CMASK_INV(ev, um, cm)     { .ev_num = ev, .umask = um, .cmask = cm, .inv = true, .edge = false }
+#define PMC_CMASK_EDG(ev, um, cm)     { .ev_num = ev, .umask = um, .cmask = cm, .inv = false, .edge = true }
+#define PMC_CMASK_INV_EDG(ev, um, cm) { .ev_num = ev, .umask = um, .cmask = cm, .inv = true, .edge = true }
 
 /* Event definitions for 06_55 */
 static struct bperf_event_tuple EVENTS_06_55[] = {
-    { INST_RETIRED_ANY,                                                 FIXED(0) },
-    { CPU_CLK_UNHALTED_THREAD,                                          FIXED(1) },
-    { CPU_CLK_UNHALTED_REF_TSC,                                         FIXED(2) },
     { LD_BLOCKS_STORE_FORWARD,                                          PMC(0x03, 0x02) },
     { LD_BLOCKS_NO_SR,                                                  PMC(0x03, 0x08) },
     { LD_BLOCKS_PARIAL_ADDRESS_ALIAS,                                   PMC(0x07, 0x01) },
@@ -106,9 +117,9 @@ static struct bperf_event_tuple EVENTS_06_55[] = {
     { CORE_POWER_THROTTLE,                                              PMC(0x28, 0x40) },
     { LONGEST_LAT_CACHE_MISS,                                           PMC(0x2e, 0x41) },
     { LONGEST_LAT_CACHE_REFERENCE,                                      PMC(0x2e, 0x4f) },
-    { CPU_CLK_UNHALTED_THREAD_P,                                        PMC(0x3c, 0x00) },
+    { CPU_CLK_UNHALTED_THREAD,                                          PMC(0x3c, 0x00) },
     { CPU_CLK_UNHALTED_RING0_TRANS,                                     PMC_CMASK_EDG(0x3c, 0x00, 1) },
-    { CPU_CLK_UNHALTED_REF_XCLK,                                        PMC(0x3c, 0x01) },
+    { CPU_CLK_UNHALTED_REF_TSC,                                         PMC(0x3c, 0x01) },
     { CPU_CLK_UNHALTED_ONE_THREAD_ACTIVE,                               PMC(0x3c, 0x02) },
     { L1D_PEND_MISS_PENDING,                                            PMC(0x48, 0x01) },
     { L1D_PIND_MISS_PENDING_CYCLES,                                     PMC_CMASK(0x48, 0x01, 1) },
@@ -191,7 +202,6 @@ static struct bperf_event_tuple EVENTS_6TH_7TH_8TH_GEN_INTEL_CORE[] = {
     { 0 }
 };
 
-#undef FIXED
 #undef PMC
 #undef PMC_CMASK
 #undef PMC_CMASK_INV

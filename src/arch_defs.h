@@ -11,10 +11,8 @@
 
 #include <linux/types.h>
 
+/* Useful macro for replicated code for each event */
 #define __BPERF_DO_FOR_EACH_EVENT \
-    __BPERF_PER_EVENT(INST_RETIRED, ANY) \
-    __BPERF_PER_EVENT(CPU_CLK_UNHALTED, THREAD) \
-    __BPERF_PER_EVENT(CPU_CLK_UNHALTED, REF_TSC) \
     __BPERF_PER_EVENT(LD_BLOCKS, STORE_FORWARD) \
     __BPERF_PER_EVENT(LD_BLOCKS, NO_SR) \
     __BPERF_PER_EVENT(LD_BLOCKS_PARIAL, ADDRESS_ALIAS) \
@@ -55,9 +53,9 @@
     __BPERF_PER_EVENT(CORE_POWER, THROTTLE) \
     __BPERF_PER_EVENT(LONGEST_LAT_CACHE, MISS) \
     __BPERF_PER_EVENT(LONGEST_LAT_CACHE, REFERENCE) \
-    __BPERF_PER_EVENT(CPU_CLK_UNHALTED, THREAD_P) \
+    __BPERF_PER_EVENT(CPU_CLK_UNHALTED, THREAD) \
     __BPERF_PER_EVENT(CPU_CLK_UNHALTED, RING0_TRANS) \
-    __BPERF_PER_EVENT(CPU_CLK_UNHALTED, REF_XCLK) \
+    __BPERF_PER_EVENT(CPU_CLK_UNHALTED, REF_TSC) \
     __BPERF_PER_EVENT(CPU_CLK_UNHALTED, ONE_THREAD_ACTIVE) \
     __BPERF_PER_EVENT(L1D_PEND_MISS, PENDING) \
     __BPERF_PER_EVENT(L1D_PIND_MISS, PENDING_CYCLES) \
@@ -124,17 +122,24 @@
     __BPERF_PER_EVENT(ITLB_MISSES, WALK_PENDING) \
     __BPERF_PER_EVENT(ITLB_MISSES, WALK_ACTIVE) \
     __BPERF_PER_EVENT(ITLB_MISSES, STLB_HIT)
+//__BPERF_PER_EVENT(INST_RETIRED, ANY)
 /* TODO: Add more events */
 
 /**
  * @brief Standardized event IDs
  */
 enum bperf_event_id {
-    NONE = 0,
+    DISABLED = 0,
 #define __BPERF_PER_EVENT(x, y) x ## _ ## y ,
     __BPERF_DO_FOR_EACH_EVENT
 #undef __BPERF_PER_EVENT
+    __UNKNOWN_EVENT__,
 };
+
+/**
+ * @brief Get name for fixed counter
+ */
+const char* bperf_get_fixed_ctr_name(size_t i);
 
 /**
  * @brief Get integer event ID for event name. 0 on failure
@@ -150,25 +155,13 @@ const char* bperf_get_event_name(enum bperf_event_id id);
  * @brief Description of an event
  *
  * This is architecture-specific, and should be queried with bperf_get_arch_event.
- * If this is a fixed counter, is_fixed will be true, and the union will have the fixed counter
- * number in fixed_num.
- * If this is a general performance monitoring counter, is_fixed will be false, and information
- * will be provided in the pmc struct
  */
 struct bperf_event {
-    bool is_fixed; /* Is this a fixed event? */
-    union {
-        /* Fixed counter number */
-        uint32_t fixed_num;
-        /* General-purpose counter information */
-        struct {
-            uint8_t ev_num; /* Event number */
-            uint8_t umask;  /* Umask value */
-            uint8_t cmask;  /* Cmask value - 0 means nothing fancy going on here */
-            bool    inv;    /* Invert flag - false means nothing fancy here, true means set */
-            bool    edge;   /* Edge detect flag - false means nothing fancy here, true means set */
-        } pmc;
-    };
+    uint8_t ev_num; /* Event number */
+    uint8_t umask;  /* Umask value */
+    uint8_t cmask;  /* Cmask value - 0 means nothing fancy going on here */
+    bool    inv;    /* Invert flag - false means nothing fancy here, true means set */
+    bool    edge;   /* Edge detect flag - false means nothing fancy here, true means set */
 };
 
 /**
