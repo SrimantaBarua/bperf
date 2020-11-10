@@ -1,5 +1,6 @@
 modules.order
 Module.symvers
+bperf
 .*.cmd
 *.o
 *.ko
