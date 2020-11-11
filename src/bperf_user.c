@@ -201,7 +201,7 @@ int main(int argc, char *const *argv) {
         exit(1);
     }
 
-    double ts_ms;
+    double ts_ms, ts_base;
 
     enable();
     atexit(disable);
@@ -215,10 +215,39 @@ int main(int argc, char *const *argv) {
     } \
 } while(0)
 
+    // First line
+    if (!should_stop) {
+        // Read timestamp line
+        READ_LINE();
+        ts_base = strtod(line, &tmp) / 1000000.0; // ns -> ms
+        ts_ms = 0.0;
+        if (tmp == line || *tmp != '\n') {
+            fprintf(stderr, "Error: failed to read timestamp\n");
+            fclose(event_fp);
+            fclose(out_fp);
+            exit(1);
+        }
+
+        // Read event lines, and ignore data
+        while (!should_stop) {
+            READ_LINE();
+            if (line[0] == '=') {
+                break;
+            }
+
+            tmp = strtok(line, " "); // Event name
+            fprintf(out_fp, ",%s", tmp);
+        }
+
+        fputc('\n', out_fp);
+    }
+
+
+    // All other lines
     while (!should_stop) {
         // Read timestamp line
         READ_LINE();
-        ts_ms = strtod(line, &tmp) / 1000000.0; // ns -> ms
+        ts_ms = strtod(line, &tmp) / 1000000.0 - ts_base; // ns -> ms
         if (tmp == line || *tmp != '\n') {
             fprintf(stderr, "Error: failed to read timestamp\n");
             fclose(event_fp);
@@ -236,11 +265,14 @@ int main(int argc, char *const *argv) {
 
             tmp = strtok(line, " "); // Event name
             while ((tmp = strtok(NULL, " "))) {
+                if (*tmp == '\n') {
+                    continue;
+                }
                 fprintf(out_fp, ",%s", tmp);
             }
-
-            fputc('\n', out_fp);
         }
+
+        fputc('\n', out_fp);
     }
 
 #undef READ_LINE
