@@ -660,13 +660,13 @@ static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread
     size_t i, j;
     uint64_t timestamp = dbuffer->data[thread_id].timestamp;
 
-    bperf_snprintf("timestamp: %llu\n", timestamp);
+    bperf_snprintf("%llu\n", timestamp);
 
     for (i = 0; i < STATE.num_pmc; i++) {
         if (STATE.pmc_id[i] == DISABLED) {
             continue;
         }
-        bperf_snprintf("%s : ", bperf_get_event_name(STATE.pmc_id[i]));
+        bperf_snprintf("%s ", bperf_get_event_name(STATE.pmc_id[i]));
         for (j = 0; j < dbuffer->num_threads; j++) {
             if (!dbuffer->data[j].has_pmc[i]) {
                 continue;
@@ -677,7 +677,7 @@ static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread
     }
 
     for (i = 0; i < STATE.num_fixed; i++) {
-        bperf_snprintf("%s : ", bperf_get_fixed_ctr_name(i));
+        bperf_snprintf("%s ", bperf_get_fixed_ctr_name(i));
         for (j = 0; j < dbuffer->num_threads; j++) {
             if (!dbuffer->data[j].has_fixed[i]) {
                 continue;
@@ -686,6 +686,8 @@ static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread
         }
         bperf_snprintf("\n");
     }
+
+    bperf_snprintf("========\n");
 
     bperf_snprintf_flush();
 }
@@ -699,18 +701,18 @@ static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t t
         printk(KERN_ALERT "bperf: Invalid thread id: %lu: max: %lu\n", thread_id, dbuffer->num_threads);
         return;
     }
-    printk(KERN_INFO "bperf: Thread %lu check-in start\n", thread_id);
+    // printk(KERN_INFO "bperf: Thread %lu check-in start\n", thread_id);
     if (dbuffer->checked_in[thread_id]) {
         wait_event_interruptible(BPERF_WQ, kthread_should_stop() || !dbuffer->checked_in[thread_id]);
         if (kthread_should_stop()) {
             return;
         }
     }
-    printk(KERN_INFO "bperf: Thread %lu check-in done: checked_in: %d: atomic: %u\n", thread_id, dbuffer->checked_in[thread_id], atomic_read(&dbuffer->to_check_in));
+    // printk(KERN_INFO "bperf: Thread %lu check-in done: checked_in: %d: atomic: %u\n", thread_id, dbuffer->checked_in[thread_id], atomic_read(&dbuffer->to_check_in));
     dbuffer->checked_in[thread_id] = true;
 
     if (atomic_dec_and_test(&dbuffer->to_check_in)) {
-        printk(KERN_INFO "bperf: Thread %lu writing to sbuffer\n", thread_id);
+        // printk(KERN_INFO "bperf: Thread %lu writing to sbuffer\n", thread_id);
         if (STATE.enabled) {
             bperf_dbuffer_to_string(dbuffer, thread_id);
         } else {
@@ -921,7 +923,7 @@ static int bperf_thread_function(void *arg_thread_id)
         }
         msleep(BPERF_MSLEEP);
         thread_state->timestamp = ktime_get_ns();
-        printk(KERN_INFO "bperf: Thread function: %u, ts: %#llx\n", smp_processor_id(), thread_state->timestamp);
+        // printk(KERN_INFO "bperf: Thread function: %u, ts: %#llx\n", smp_processor_id(), thread_state->timestamp);
         for (i = 0; i < STATE.num_pmc; i++) {
             r = bperf_rdmsr(MSR_PMC(i));
             if (r < thread_state->last_pmc[i]) {
