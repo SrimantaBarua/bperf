@@ -191,6 +191,10 @@ static DECLARE_WAIT_QUEUE_HEAD(ENABLED_WQ);
 
 // ======== Userspace-visible module state ========
 
+static ssize_t num_cores_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%lu\n", STATE.num_threads);
+}
+
 static ssize_t num_pmc_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
     return sprintf(buf, "%u\n", STATE.num_pmc);
 }
@@ -307,6 +311,7 @@ static ssize_t pmc3_store(struct kobject *kobj, struct kobj_attribute *attr, con
     }
 }
 
+static struct kobj_attribute num_cores_attr     = __ATTR_RO(num_cores);
 static struct kobj_attribute num_pmc_attr       = __ATTR_RO(num_pmc);
 static struct kobj_attribute num_fixed_attr     = __ATTR_RO(num_fixed);
 static struct kobj_attribute arch_perf_ver_attr = __ATTR_RO(arch_perf_ver);
@@ -1019,6 +1024,10 @@ static int __init bperf_init(void)
         ret = PTR_ERR(STATE.kobj);
         goto error_kobj;
     }
+    if ((ret = sysfs_create_file(STATE.kobj, &num_cores_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_cores_attr;
+    }
     if ((ret = sysfs_create_file(STATE.kobj, &num_pmc_attr.attr))) {
         printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
         goto error_pmc_attr;
@@ -1094,6 +1103,8 @@ error_perf_ver_attr:
 error_fixed_attr:
     sysfs_remove_file(STATE.kobj, &num_pmc_attr.attr);
 error_pmc_attr:
+    sysfs_remove_file(STATE.kobj, &num_cores_attr.attr);
+error_cores_attr:
     kobject_put(STATE.kobj);
 error_kobj:
     cdev_del(&STATE.cdev);
@@ -1128,6 +1139,7 @@ static void __exit bperf_exit(void)
     sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);
     sysfs_remove_file(STATE.kobj, &num_fixed_attr.attr);
     sysfs_remove_file(STATE.kobj, &num_pmc_attr.attr);
+    sysfs_remove_file(STATE.kobj, &num_cores_attr.attr);
     kobject_put(STATE.kobj);
     cdev_del(&STATE.cdev);
     device_destroy(STATE.class, STATE.dev);
