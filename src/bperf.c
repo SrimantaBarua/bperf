@@ -27,17 +27,15 @@
 
 #include "arch_defs.h"
 
-#define BPERF_NAME      "bperf"
-#define BPERF_LICENSE   "GPL"
-#define BPERF_AUTHOR    "Srimanta Barua <srimanta.barua1@gmail.com>"
-#define BPERF_DESC      "Kernel module for high frequency counter sampling on x86_64 systems"
-#define BPERF_VERSION   "0.1"
-#define BPERF_HZ        5
-#define BPERF_MIN_ARCH  2
-#define BPERF_MSLEEP    (1000 / BPERF_HZ)
-
-#define BPERF_MAX_PMC   4
-#define BPERF_MAX_FIXED 3
+#define BPERF_NAME             "bperf"
+#define BPERF_LICENSE          "GPL"
+#define BPERF_AUTHOR           "Srimanta Barua <srimanta.barua1@gmail.com>"
+#define BPERF_DESC             "Kernel module for high frequency counter sampling on x86_64 systems"
+#define BPERF_VERSION          "0.1"
+#define BPERF_MIN_ARCH         2
+#define BPERF_DEFAULT_INTERVAL 20
+#define BPERF_MAX_PMC          4
+#define BPERF_MAX_FIXED        3
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -163,8 +161,9 @@ static struct bperf_state {
     uint32_t family; /* Display_Family */
     uint32_t model;  /* Display_Model */
     /* Module information */
-    size_t             num_threads;  /* Number of threads we spawned */
-    struct task_struct **thread_ptr; /* Pointers to task struct for kernel thread */
+    size_t             num_threads;     /* Number of threads we spawned */
+    size_t             sample_interval; /* Sample interval in milliseconds */
+    struct task_struct **thread_ptr;    /* Pointers to task struct for kernel thread */
     /* Performance monitoring capabilities */
     bool                enabled;       /* Whether performance monitoring is enabled */
     uint32_t            arch_perf_ver; /* Version ID of architectural performance monitoring */
@@ -190,6 +189,23 @@ static struct bperf_state {
 static DECLARE_WAIT_QUEUE_HEAD(ENABLED_WQ);
 
 // ======== Userspace-visible module state ========
+
+static ssize_t sample_interval_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%lu\n", STATE.sample_interval);
+}
+
+static ssize_t sample_interval_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
+    uint32_t interval;
+    int ret;
+    if (STATE.enabled) {
+        return -EBUSY;
+    }
+    if ((ret = kstrtou32(buf, 10, &interval))) {
+        return ret;
+    }
+    STATE.sample_interval = interval;
+    return count;
+}
 
 static ssize_t num_cores_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
     return sprintf(buf, "%lu\n", STATE.num_threads);
@@ -311,11 +327,12 @@ static ssize_t pmc3_store(struct kobject *kobj, struct kobj_attribute *attr, con
     }
 }
 
-static struct kobj_attribute num_cores_attr     = __ATTR_RO(num_cores);
-static struct kobj_attribute num_pmc_attr       = __ATTR_RO(num_pmc);
-static struct kobj_attribute num_fixed_attr     = __ATTR_RO(num_fixed);
-static struct kobj_attribute arch_perf_ver_attr = __ATTR_RO(arch_perf_ver);
-static struct kobj_attribute enabled_attr       = __ATTR_RW(enabled);
+static struct kobj_attribute sample_interval_attr = __ATTR_RW(sample_interval);
+static struct kobj_attribute num_cores_attr       = __ATTR_RO(num_cores);
+static struct kobj_attribute num_pmc_attr         = __ATTR_RO(num_pmc);
+static struct kobj_attribute num_fixed_attr       = __ATTR_RO(num_fixed);
+static struct kobj_attribute arch_perf_ver_attr   = __ATTR_RO(arch_perf_ver);
+static struct kobj_attribute enabled_attr         = __ATTR_RW(enabled);
 // TODO: Align with BPERF_MAX_PMC
 static struct kobj_attribute pmc_attrs[] = {
     __ATTR_RW(pmc0),
@@ -840,6 +857,14 @@ static void bperf_get_arch_perfmon_capabilities(void)
 }
 
 /**
+ * @brief Fill default values for module state
+ */
+static void bperf_fill_state_defaults(void)
+{
+    STATE.sample_interval = BPERF_DEFAULT_INTERVAL;
+}
+
+/**
  * @brief Setup or disable counting on a single PMC for a single thread
  */
 static bool bperf_thread_setup_pmc(size_t thread_id, size_t pmc_id)
@@ -926,7 +951,7 @@ static int bperf_thread_function(void *arg_thread_id)
             }
             bperf_wrmsr(MSR_PERF_GLOBAL_CTRL, ctrl);
         }
-        msleep(BPERF_MSLEEP);
+        msleep(STATE.sample_interval);
         thread_state->timestamp = ktime_get_ns();
         // printk(KERN_INFO "bperf: Thread function: %u, ts: %#llx\n", smp_processor_id(), thread_state->timestamp);
         for (i = 0; i < STATE.num_pmc; i++) {
@@ -974,6 +999,7 @@ static int __init bperf_init(void)
     printk(KERN_INFO "bperf: Loading...\n");
     bperf_identify_processor();
     bperf_get_arch_perfmon_capabilities();
+    bperf_fill_state_defaults();
     if (STATE.arch_perf_ver < BPERF_MIN_ARCH || STATE.num_pmc == 0) {
         printk(KERN_ALERT "bperf: Not enough support for performance monitoring\n");
         return -1;
@@ -1044,6 +1070,10 @@ static int __init bperf_init(void)
         printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
         goto error_enabled_attr;
     }
+    if ((ret = sysfs_create_file(STATE.kobj, &sample_interval_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_sample_interval_attr;
+    }
     for (j = 0; j < STATE.num_pmc; j++) {
         if ((ret = sysfs_create_file(STATE.kobj, &pmc_attrs[j].attr))) {
             printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
@@ -1095,6 +1125,8 @@ error_pmc_attrs:
     for (i = 0; i <= j; i++) {
         sysfs_remove_file(STATE.kobj, &pmc_attrs[i].attr);
     }
+    sysfs_remove_file(STATE.kobj, &sample_interval_attr.attr);
+error_sample_interval_attr:
     sysfs_remove_file(STATE.kobj, &enabled_attr.attr);
 error_enabled_attr:
     sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);

@@ -41,6 +41,16 @@ static bool is_known_event(const char *event) {
     return false;
 }
 
+static void write_number(const char *path, unsigned num, const char *errmsg) {
+    FILE *f;
+    if (!(f = fopen(path, "w"))) {
+        fprintf(stderr, "Error: failed to open path \"%s\": %s\n", path, strerror(errno));
+        exit(1);
+    }
+    fprintf(f, "%u", num);
+    fclose(f);
+}
+
 static unsigned read_number(const char *path, const char *errmsg) {
     unsigned ret;
     FILE *f;
@@ -116,8 +126,8 @@ static void list_events() {
 }
 
 static const char *output_path = "bperf_output.csv";
-static long sample_interval    = 20;
 static bool should_stop        = false;
+static int sample_interval     = 20;
 static unsigned num_pmc        = 0;
 static unsigned num_fixed      = 0;
 static unsigned num_cores      = 0;
@@ -176,6 +186,52 @@ static void sig_handler(int sig) {
     }
 }
 
+static void write_first_line(FILE *event_fp, FILE *out_fp, char **line, size_t *line_size, double *ts_base, double *ts_ms) {
+    char *tmp;
+    unsigned i;
+
+#define READ_LINE() do { \
+    if (getline(line, line_size, event_fp) < 0 || !*line) { \
+        perror("Error: failed to read events"); \
+        fclose(event_fp); \
+        fclose(out_fp); \
+        exit(1); \
+    } \
+} while(0)
+
+    // First line
+    if (!should_stop) {
+        // Read timestamp line
+        READ_LINE();
+        *ts_base = strtod(*line, &tmp) / 1000000.0; // ns -> ms
+        *ts_ms = 0.0;
+        if (tmp == *line || *tmp != '\n') {
+            fprintf(stderr, "Error: failed to read timestamp\n");
+            fclose(event_fp);
+            fclose(out_fp);
+            exit(1);
+        }
+
+        // Read event lines, and ignore data
+        while (!should_stop) {
+            READ_LINE();
+            if ((*line)[0] == '=') {
+                break;
+            }
+
+            tmp = strtok(*line, " "); // Event name
+            for (i = 0; i < num_cores; i++) {
+                fprintf(out_fp, ",%s-%u", tmp, i);
+            }
+        }
+
+        fputc('\n', out_fp);
+    }
+
+#undef READ_LINE
+
+}
+
 int main(int argc, char *const *argv) {
     disable();
     num_pmc = get_num_pmc();
@@ -183,8 +239,7 @@ int main(int argc, char *const *argv) {
     num_cores = get_num_cores();
 
     parse_args(argc, argv);
-    printf("Profiling with interval %ld ms and writing output to %s ...\n",
-            sample_interval, output_path);
+    printf("Profiling with interval %d ms and writing output to %s ...\n", sample_interval, output_path);
     signal(SIGINT, sig_handler);
 
     char *line = NULL, *tmp;
@@ -206,6 +261,8 @@ int main(int argc, char *const *argv) {
     enable();
     atexit(disable);
 
+    write_first_line(event_fp, out_fp, &line, &line_size, &ts_base, &ts_ms);
+
 #define READ_LINE() do { \
     if (getline(&line, &line_size, event_fp) < 0 || !line) { \
         perror("Error: failed to read events"); \
@@ -214,34 +271,6 @@ int main(int argc, char *const *argv) {
         exit(1); \
     } \
 } while(0)
-
-    // First line
-    if (!should_stop) {
-        // Read timestamp line
-        READ_LINE();
-        ts_base = strtod(line, &tmp) / 1000000.0; // ns -> ms
-        ts_ms = 0.0;
-        if (tmp == line || *tmp != '\n') {
-            fprintf(stderr, "Error: failed to read timestamp\n");
-            fclose(event_fp);
-            fclose(out_fp);
-            exit(1);
-        }
-
-        // Read event lines, and ignore data
-        while (!should_stop) {
-            READ_LINE();
-            if (line[0] == '=') {
-                break;
-            }
-
-            tmp = strtok(line, " "); // Event name
-            fprintf(out_fp, ",%s", tmp);
-        }
-
-        fputc('\n', out_fp);
-    }
-
 
     // All other lines
     while (!should_stop) {
