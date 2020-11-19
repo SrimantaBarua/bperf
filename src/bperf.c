@@ -924,7 +924,7 @@ static void bperf_identify_processor(void)
     if (STATE.family == 0x0f) {
         STATE.family += (eax >> 20) & 0xff;
     }
-    printk(KERN_INFO "bperf: CPU family: %#x, model: %u, stepping: %u\n", STATE.family, STATE.model, stepping);
+    printk(KERN_INFO "bperf: CPU family: %#x, model: %#x, stepping: %u\n", STATE.family, STATE.model, stepping);
 }
 
 /**
@@ -986,7 +986,7 @@ static bool bperf_thread_setup_pmc(size_t thread_id, size_t pmc_id)
     thread_state = &DBUFFER.data[thread_id];
     val = thread_state->perfevtsel_bak[pmc_id];
     val &= PERFEVTSEL_RESERVED;
-    val |= PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_USR;
+    val |= PERFEVTSEL_FLAG_OS | PERFEVTSEL_FLAG_USR | PERFEVTSEL_FLAG_ENABLE;
     if (STATE.arch_perf_ver >= 3) {
         val &= ~PERFEVTSEL_FLAG_ANYTHRD;
     }
