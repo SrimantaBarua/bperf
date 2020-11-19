@@ -1,5 +1,4 @@
-obj-m      += bperf.o
-bperf-objs += src/bperf.o src/arch_defs.o
+obj-m += src/bperf.o
 
 .PHONY: all clean bperf_kobj bperf_user
 

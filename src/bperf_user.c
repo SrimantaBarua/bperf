@@ -12,30 +12,52 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "arch_def_macro.h"
 
-#define PATH_ENABLED   "/sys/kernel/bperf/enabled"
-#define PATH_NUM_PMC   "/sys/kernel/bperf/num_pmc"
-#define PATH_NUM_FIXED "/sys/kernel/bperf/num_fixed"
-#define PATH_NUM_CORES "/sys/kernel/bperf/num_cores"
-#define PATH_PMC_FMT   "/sys/kernel/bperf/pmc%u"
-#define PATH_DATA      "/dev/bperf"
+#define PATH_ENABLED    "/sys/kernel/bperf/enabled"
+#define PATH_NUM_PMC    "/sys/kernel/bperf/num_pmc"
+#define PATH_NUM_FIXED  "/sys/kernel/bperf/num_fixed"
+#define PATH_NUM_CORES  "/sys/kernel/bperf/num_cores"
+#define PATH_CPU_FAMILY "/sys/kernel/bperf/cpu_family"
+#define PATH_CPU_MODEL  "/sys/kernel/bperf/cpu_model"
+#define PATH_PMC_FMT    "/sys/kernel/bperf/pmc%u"
+#define PATH_DATA       "/dev/bperf"
 
-static const char *events[] = {
-#define __BPERF_PER_EVENT(x, y) #x "." #y,
-    __BPERF_DO_FOR_EACH_EVENT
-#undef __BPERF_PER_EVENT
-    NULL,
+#define PMC(x, y, ev, um)                   { #x "." #y }
+#define PMC_CMASK(x, y, ev, um, cm)         PMC(x, y, ev, um)
+#define PMC_EDG(x, y, ev, um)               PMC(x, y, ev, um)
+#define PMC_CMASK_INV(x, y, ev, um, cm)     PMC(x, y, ev, um)
+#define PMC_CMASK_EDG(x, y, ev, um, cm)     PMC(x, y, ev, um)
+#define PMC_CMASK_INV_EDG(x, y, ev, um, cm) PMC(x, y, ev, um)
+
+struct bperf_event_tuple {
+    const char *name;
 };
 
-static bool is_known_event(const char *event) {
-    for (size_t i = 0; events[i]; i++) {
-        if (!strcmp(event, events[i])) {
-            return true;
+#include "arch_events.c"
+
+#undef PMC
+#undef PMC_CMASK
+#undef PMC_EDG
+#undef PMC_CMASK_INV
+#undef PMC_CMASK_EDG
+#undef PMC_CMASK_INV_EDG
+
+static bool is_known_event(unsigned family, unsigned model, const char *event) {
+    size_t evi, archi, n_archs = sizeof(EVENTS) / sizeof(EVENTS[0]);
+    for (archi = 0; archi < n_archs; archi++) {
+        if (EVENTS[archi].family != family || EVENTS[archi].model != model) {
+            continue;
+        }
+        for (evi = 0; EVENTS[archi].events[evi].name; evi++) {
+            if (!strcmp(EVENTS[archi].events[evi].name, event)) {
+                return true;
+            }
         }
     }
     return false;
@@ -79,6 +101,14 @@ static unsigned get_num_cores() {
     return read_number(PATH_NUM_CORES, "failed to read number of cores");
 }
 
+static unsigned get_cpu_family() {
+    return read_number(PATH_CPU_FAMILY, "failed to read cpu family");
+}
+
+static unsigned get_cpu_model() {
+    return read_number(PATH_CPU_MODEL, "failed to read cpu model");
+}
+
 static void write_str(const char *path, const char *str, size_t len, const char *errmsg) {
     int fd, ret;
     if ((fd = open(path, O_WRONLY)) <= 0) {
@@ -118,11 +148,29 @@ static void print_usage(char *const progname) {
            progname);
 }
 
-static void list_events() {
-    printf("Events:\n");
-    for (size_t i = 0; events[i]; i++) {
-        printf("    %s\n", events[i]);
+static void list_events(unsigned family, unsigned model) {
+    size_t evi, archi, n_archs = sizeof(EVENTS) / sizeof(EVENTS[0]);
+    for (archi = 0; archi < n_archs; archi++) {
+        if (EVENTS[archi].family != family || EVENTS[archi].model != model) {
+            continue;
+        }
+        printf("Events:\n");
+        for (evi = 0; EVENTS[archi].events[evi].name; evi++) {
+            printf("    %s\n", EVENTS[archi].events[evi].name);
+        }
+        return;
     }
+    fprintf(stderr, "Error: unsupported architecture: DisplayFamily_Display_Model = %02x_%02x\n", family, model);
+}
+
+static bool is_arch_supported(unsigned family, unsigned model) {
+    size_t archi, n_archs = sizeof(EVENTS) / sizeof(EVENTS[0]);
+    for (archi = 0; archi < n_archs; archi++) {
+        if (EVENTS[archi].family == family && EVENTS[archi].model == model) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static const char *output_path = "bperf_output.csv";
@@ -131,6 +179,8 @@ static int sample_interval     = 20;
 static unsigned num_pmc        = 0;
 static unsigned num_fixed      = 0;
 static unsigned num_cores      = 0;
+static unsigned cpu_family     = 0;
+static unsigned cpu_model      = 0;
 
 static void parse_args(int argc, char *const *argv) {
     char *const progname = argv[0];
@@ -148,7 +198,7 @@ static void parse_args(int argc, char *const *argv) {
     while ((c = getopt_long(argc, argv, "hlo:i:", long_opts, &index)) >= 0) {
         switch (c) {
         case 'l':
-            list_events();
+            list_events(cpu_family, cpu_model);
             exit(0);
         case 'o':
             output_path = optarg;
@@ -170,7 +220,7 @@ static void parse_args(int argc, char *const *argv) {
     }
 
     while (optind < argc && pmc_id < num_pmc) {
-        if (!is_known_event(argv[optind])) {
+        if (!is_known_event(cpu_family, cpu_model, argv[optind])) {
             printf("Error: unknown event: \"%s\"\n", argv[optind]);
             exit(1);
         }
@@ -237,6 +287,13 @@ int main(int argc, char *const *argv) {
     num_pmc = get_num_pmc();
     num_fixed = get_num_fixed();
     num_cores = get_num_cores();
+    cpu_family = get_cpu_family();
+    cpu_model = get_cpu_model();
+
+    if (!is_arch_supported(cpu_family, cpu_model)) {
+        fprintf(stderr, "Error: unsupported architecture: DisplayFamily_Display_Model = %02x_%02x\n", cpu_family, cpu_model);
+        exit(1);
+    }
 
     parse_args(argc, argv);
     printf("Profiling with interval %d ms and writing output to %s ...\n", sample_interval, output_path);

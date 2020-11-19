@@ -25,7 +25,7 @@
 #include <linux/wait.h>
 #include <asm/smp.h>
 
-#include "arch_defs.h"
+#include "arch_def_macro.h"
 
 #define BPERF_NAME             "bperf"
 #define BPERF_LICENSE          "GPL"
@@ -39,6 +39,106 @@
 
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
+
+// ======== Events ================
+
+/**
+ * @brief Description of an event
+ *
+ * This is architecture-specific, and should be queried with bperf_get_arch_event.
+ */
+struct bperf_event {
+    uint8_t ev_num; /* Event number */
+    uint8_t umask;  /* Umask value */
+    uint8_t cmask;  /* Cmask value - 0 means nothing fancy going on here */
+    bool    inv;    /* Invert flag - false means nothing fancy here, true means set */
+    bool    edge;   /* Edge detect flag - false means nothing fancy here, true means set */
+};
+
+/**
+ * @brief Get name for fixed counter
+ */
+static const char* bperf_get_fixed_ctr_name(size_t i) {
+    switch (i) {
+    case 0:  return "INST_RETIRED.ANY";
+    case 1:  return "CPU_CLK_UNHALTED.THREAD";
+    case 2:  return "CPU_CLK_UNHALTED.REF_TSC";
+    default: return "__UNKNOWN_EVENT__";
+    }
+}
+
+/**
+ * @brief Get integer event ID for event name. 0 on failure
+ */
+static enum bperf_event_id bperf_get_event_id(const char *name, size_t len)
+{
+#define __BPERF_PER_EVENT(x, y) do { \
+    if (!strncmp(name, #x "." #y, len)) { \
+        return x ## _ ## y; \
+    } \
+} while (0);
+    __BPERF_DO_FOR_EACH_EVENT
+#undef __BPERF_PER_EVENT
+    if (!strncmp(name, "DISABLED", len)) {
+        return DISABLED;
+    }
+    return __UNKNOWN_EVENT__;
+}
+
+static const char* bperf_get_event_name(enum bperf_event_id id)
+{
+#define __BPERF_PER_EVENT(x, y) case x ## _ ## y : return #x "." #y;
+    switch (id) {
+        case DISABLED: return "DISABLED";
+        __BPERF_DO_FOR_EACH_EVENT
+        default: return "__UNKNOWN_EVENT__";
+    }
+#undef __BPERF_PER_EVENT
+}
+
+/**
+ * @brief A tuple of standardized event number, and information
+ */
+struct bperf_event_tuple {
+    enum bperf_event_id id; /* Standardized event ID */
+    struct bperf_event  ev; /* Event information struct */
+};
+
+// Helper macros for static event definitions
+#define PMC(x, y, ev, um)                   { x ## _ ##  y , { .ev_num = ev, .umask = um, .cmask = 0,  .inv = false, .edge = false } }
+#define PMC_CMASK(x, y, ev, um, cm)         { x ## _ ##  y , { .ev_num = ev, .umask = um, .cmask = cm, .inv = false, .edge = false } }
+#define PMC_EDG(x, y, ev, um)               { x ## _ ##  y , { .ev_num = ev, .umask = um, .cmask = 0, .inv = false, .edge = true } }
+#define PMC_CMASK_INV(x, y, ev, um, cm)     { x ## _ ##  y , { .ev_num = ev, .umask = um, .cmask = cm, .inv = true, .edge = false } }
+#define PMC_CMASK_EDG(x, y, ev, um, cm)     { x ## _ ##  y , { .ev_num = ev, .umask = um, .cmask = cm, .inv = false, .edge = true } }
+#define PMC_CMASK_INV_EDG(x, y, ev, um, cm) { x ## _ ##  y , { .ev_num = ev, .umask = um, .cmask = cm, .inv = true, .edge = true } }
+
+#include "arch_events.c"
+
+#undef PMC
+#undef PMC_CMASK
+#undef PMC_EDG
+#undef PMC_CMASK_INV
+#undef PMC_CMASK_EDG
+#undef PMC_CMASK_INV_EDG
+
+/**
+ * @brief Get architecture-specific description of event
+ */
+static const struct bperf_event* bperf_get_arch_event(enum bperf_event_id id, uint8_t family, uint8_t model)
+{
+    size_t evi, archi, n_archs = sizeof(EVENTS) / sizeof(EVENTS[0]);
+    for (archi = 0; archi < n_archs; archi++) {
+        if (EVENTS[archi].family != family || EVENTS[archi].model != model) {
+            continue;
+        }
+        for (evi = 0; EVENTS[archi].events[evi].id != 0; evi++) {
+            if (EVENTS[archi].events[evi].id == id) {
+                return &EVENTS[archi].events[evi].ev;
+            }
+        }
+    }
+    return NULL;
+}
 
 // ======== MSRs, hardware counters ========
 
@@ -211,6 +311,14 @@ static ssize_t num_cores_show(struct kobject *kobj, struct kobj_attribute *attr,
     return sprintf(buf, "%lu\n", STATE.num_threads);
 }
 
+static ssize_t cpu_family_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", STATE.family);
+}
+
+static ssize_t cpu_model_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+    return sprintf(buf, "%u\n", STATE.model);
+}
+
 static ssize_t num_pmc_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
     return sprintf(buf, "%u\n", STATE.num_pmc);
 }
@@ -329,6 +437,8 @@ static ssize_t pmc3_store(struct kobject *kobj, struct kobj_attribute *attr, con
 
 static struct kobj_attribute sample_interval_attr = __ATTR_RW(sample_interval);
 static struct kobj_attribute num_cores_attr       = __ATTR_RO(num_cores);
+static struct kobj_attribute cpu_family_attr      = __ATTR_RO(cpu_family);
+static struct kobj_attribute cpu_model_attr       = __ATTR_RO(cpu_model);
 static struct kobj_attribute num_pmc_attr         = __ATTR_RO(num_pmc);
 static struct kobj_attribute num_fixed_attr       = __ATTR_RO(num_fixed);
 static struct kobj_attribute arch_perf_ver_attr   = __ATTR_RO(arch_perf_ver);
@@ -1074,6 +1184,14 @@ static int __init bperf_init(void)
         printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
         goto error_sample_interval_attr;
     }
+    if ((ret = sysfs_create_file(STATE.kobj, &cpu_family_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_cpu_family_attr;
+    }
+    if ((ret = sysfs_create_file(STATE.kobj, &cpu_model_attr.attr))) {
+        printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
+        goto error_cpu_model_attr;
+    }
     for (j = 0; j < STATE.num_pmc; j++) {
         if ((ret = sysfs_create_file(STATE.kobj, &pmc_attrs[j].attr))) {
             printk(KERN_ALERT "bperf: Failed to create sysfs attribute\n");
@@ -1125,6 +1243,10 @@ error_pmc_attrs:
     for (i = 0; i <= j; i++) {
         sysfs_remove_file(STATE.kobj, &pmc_attrs[i].attr);
     }
+    sysfs_remove_file(STATE.kobj, &cpu_model_attr.attr);
+error_cpu_model_attr:
+    sysfs_remove_file(STATE.kobj, &cpu_family_attr.attr);
+error_cpu_family_attr:
     sysfs_remove_file(STATE.kobj, &sample_interval_attr.attr);
 error_sample_interval_attr:
     sysfs_remove_file(STATE.kobj, &enabled_attr.attr);
@@ -1167,6 +1289,9 @@ static void __exit bperf_exit(void)
     for (i = 0; i < STATE.num_pmc; i++) {
         sysfs_remove_file(STATE.kobj, &pmc_attrs[i].attr);
     }
+    sysfs_remove_file(STATE.kobj, &cpu_model_attr.attr);
+    sysfs_remove_file(STATE.kobj, &cpu_family_attr.attr);
+    sysfs_remove_file(STATE.kobj, &sample_interval_attr.attr);
     sysfs_remove_file(STATE.kobj, &enabled_attr.attr);
     sysfs_remove_file(STATE.kobj, &arch_perf_ver_attr.attr);
     sysfs_remove_file(STATE.kobj, &num_fixed_attr.attr);
