@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -47,6 +48,10 @@ struct bperf_event_tuple {
 #undef PMC_CMASK_INV
 #undef PMC_CMASK_EDG
 #undef PMC_CMASK_INV_EDG
+
+static size_t max(size_t a, size_t b) {
+    return a > b ? a : b;
+}
 
 static bool is_known_event(unsigned family, unsigned model, const char *event) {
     size_t evi, archi, n_archs = sizeof(EVENTS) / sizeof(EVENTS[0]);
@@ -236,6 +241,27 @@ static void sig_handler(int sig) {
     }
 }
 
+static size_t write_buffer(char **buf, size_t *sz, size_t off, const char *fmt, ...) {
+    char *tmp;
+    size_t ret, newsz;
+    va_list args;
+    va_start(args, fmt);
+    if ((ret = vsnprintf(*buf + off, *sz - off, fmt, args)) >= *sz - off) {
+        va_end(args);
+        newsz = off + ret + 1;
+        if (!(tmp = realloc(*buf, newsz))) {
+            perror("Error: realloc()");
+            exit(1);
+        }
+        *buf = tmp;
+        *sz = newsz;
+        va_start(args, fmt);
+        ret = vsnprintf(*buf + off, *sz - off, fmt, args);
+    }
+    va_end(args);
+    return ret;
+}
+
 static void write_first_line(FILE *event_fp, FILE *out_fp, char **line, size_t *line_size, double *ts_base, double *ts_ms) {
     char *tmp;
     unsigned i;
@@ -261,6 +287,7 @@ static void write_first_line(FILE *event_fp, FILE *out_fp, char **line, size_t *
             fclose(out_fp);
             exit(1);
         }
+        fprintf(out_fp, "time (ms)");
 
         // Read event lines, and ignore data
         while (!should_stop) {
@@ -299,8 +326,8 @@ int main(int argc, char *const *argv) {
     printf("Profiling with interval %d ms and writing output to %s ...\n", sample_interval, output_path);
     signal(SIGINT, sig_handler);
 
-    char *line = NULL, *tmp;
-    size_t line_size = 0;
+    char *line = NULL, *tmp, *out_line = NULL;
+    size_t line_size = 0, out_line_size = 0, offset;
     FILE *event_fp = fopen(PATH_DATA, "r");
     if (!event_fp) {
         perror("Error: failed to open \"" PATH_DATA "\" to read events");
@@ -331,6 +358,8 @@ int main(int argc, char *const *argv) {
 
     // All other lines
     while (!should_stop) {
+        offset = 0;
+
         // Read timestamp line
         READ_LINE();
         ts_ms = strtod(line, &tmp) / 1000000.0 - ts_base; // ns -> ms
@@ -340,7 +369,7 @@ int main(int argc, char *const *argv) {
             fclose(out_fp);
             exit(1);
         }
-        fprintf(out_fp, "%f", ts_ms);
+        offset += write_buffer(&out_line, &out_line_size, offset, "%f", ts_ms);
 
         // Read event lines
         while (!should_stop) {
@@ -354,14 +383,17 @@ int main(int argc, char *const *argv) {
                 if (*tmp == '\n') {
                     continue;
                 }
-                fprintf(out_fp, ",%s", tmp);
+                offset += write_buffer(&out_line, &out_line_size, offset, ",%s", tmp);
             }
         }
 
-        fputc('\n', out_fp);
+        fprintf(out_fp, "%s\n", out_line);
     }
 
 #undef READ_LINE
+
+    free(line);
+    free(out_line);
 
     fclose(event_fp);
     fclose(out_fp);
