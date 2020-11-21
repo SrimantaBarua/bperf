@@ -9,11 +9,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -340,12 +341,13 @@ int main(int argc, char *const *argv) {
         exit(1);
     }
 
-    double ts_ms, ts_base;
+    double ts_ms, ts_base, ts_last, data;
 
     enable();
     atexit(disable);
 
     write_first_line(event_fp, out_fp, &line, &line_size, &ts_base, &ts_ms);
+    ts_ms = ts_base;
 
 #define READ_LINE() do { \
     if (getline(&line, &line_size, event_fp) < 0 || !line) { \
@@ -362,14 +364,15 @@ int main(int argc, char *const *argv) {
 
         // Read timestamp line
         READ_LINE();
-        ts_ms = strtod(line, &tmp) / 1000000.0 - ts_base; // ns -> ms
+        ts_last = ts_ms;
+        ts_ms = round(strtod(line, &tmp) / 1000000.0 - ts_base); // ns -> ms
         if (tmp == line || *tmp != '\n') {
             fprintf(stderr, "Error: failed to read timestamp\n");
             fclose(event_fp);
             fclose(out_fp);
             exit(1);
         }
-        offset += write_buffer(&out_line, &out_line_size, offset, "%f", ts_ms);
+        offset += write_buffer(&out_line, &out_line_size, offset, "%0.lf", ts_ms);
 
         // Read event lines
         while (!should_stop) {
@@ -383,11 +386,14 @@ int main(int argc, char *const *argv) {
                 if (*tmp == '\n') {
                     continue;
                 }
-                offset += write_buffer(&out_line, &out_line_size, offset, ",%s", tmp);
+                data = (strtod(tmp, NULL) * sample_interval) / (ts_ms - ts_last);
+                offset += write_buffer(&out_line, &out_line_size, offset, ",%0.3lf", data);
             }
         }
 
-        fprintf(out_fp, "%s\n", out_line);
+        if (!should_stop) {
+            fprintf(out_fp, "%s\n", out_line);
+        }
     }
 
 #undef READ_LINE

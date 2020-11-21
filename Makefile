@@ -10,7 +10,7 @@ bperf_kobj:
 bperf_user: bperf
 
 bperf: src/bperf_user.c
-	gcc -o $@ $^ -O2
+	gcc -o $@ $^ -O2 -lm
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
