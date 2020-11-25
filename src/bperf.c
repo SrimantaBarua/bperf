@@ -70,8 +70,7 @@ static const char* bperf_get_fixed_ctr_name(size_t i) {
 /**
  * @brief Get integer event ID for event name. 0 on failure
  */
-static enum bperf_event_id bperf_get_event_id(const char *name, size_t len)
-{
+static enum bperf_event_id bperf_get_event_id(const char *name, size_t len) {
 #define __BPERF_PER_EVENT(x, y) do { \
     if (!strncmp(name, #x "." #y, len)) { \
         return x ## _ ## y; \
@@ -85,8 +84,7 @@ static enum bperf_event_id bperf_get_event_id(const char *name, size_t len)
     return __UNKNOWN_EVENT__;
 }
 
-static const char* bperf_get_event_name(enum bperf_event_id id)
-{
+static const char* bperf_get_event_name(enum bperf_event_id id) {
 #define __BPERF_PER_EVENT(x, y) case x ## _ ## y : return #x "." #y;
     switch (id) {
         case DISABLED: return "DISABLED";
@@ -124,8 +122,7 @@ struct bperf_event_tuple {
 /**
  * @brief Get architecture-specific description of event
  */
-static const struct bperf_event* bperf_get_arch_event(enum bperf_event_id id, uint8_t family, uint8_t model)
-{
+static const struct bperf_event* bperf_get_arch_event(enum bperf_event_id id, uint8_t family, uint8_t model) {
     size_t evi, archi, n_archs = sizeof(EVENTS) / sizeof(EVENTS[0]);
     for (archi = 0; archi < n_archs; archi++) {
         if (EVENTS[archi].family != family || EVENTS[archi].model != model) {
@@ -219,8 +216,7 @@ static inline uint64_t perfevtsel_from_ev(const struct bperf_event *e) {
 /**
  * @brief Read 64-bit data from an MSR
  */
-static uint64_t bperf_rdmsr(uint32_t msr)
-{
+static uint64_t bperf_rdmsr(uint32_t msr) {
     uint32_t eax, edx;
     __asm__("rdmsr\n" : "=a"(eax), "=d"(edx) : "c"(msr) : );
     return ((uint64_t) edx << 32) | eax;
@@ -229,8 +225,7 @@ static uint64_t bperf_rdmsr(uint32_t msr)
 /**
  * @brief Write 64-bit data to MSR
  */
-static void bperf_wrmsr(uint32_t msr, uint64_t val)
-{
+static void bperf_wrmsr(uint32_t msr, uint64_t val) {
     uint32_t eax, edx;
     edx = (val >> 32) & 0xffffffff;
     eax = val & 0xffffffff;
@@ -240,8 +235,7 @@ static void bperf_wrmsr(uint32_t msr, uint64_t val)
 /**
  * @brief Get information from CPUID
  */
-static void bperf_cpuid(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
-{
+static void bperf_cpuid(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
     __asm__("cpuid\n" : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx) : "a"(*eax), "c"(*ecx) : );
 }
 
@@ -473,16 +467,14 @@ struct bperf_sbuffer_node {
 /**
  * @brief Get pointer to dat for node
  */
-static char* bperf_sbuffer_node_data(struct bperf_sbuffer_node *node)
-{
+static char* bperf_sbuffer_node_data(struct bperf_sbuffer_node *node) {
     return ((char*) node) + sizeof(struct bperf_sbuffer_node);
 }
 
 /**
  * @brief Allocate a new empty buffer node
  */
-static struct bperf_sbuffer_node* bperf_sbuffer_node_new(void)
-{
+static struct bperf_sbuffer_node* bperf_sbuffer_node_new(void) {
     struct bperf_sbuffer_node *ret = kmalloc(BPERF_SBUFFER_BLK_SZ, GFP_KERNEL);
     if (!ret || IS_ERR(ret)) {
         printk(KERN_ALERT "bperf: kmalloc failed\n");
@@ -496,8 +488,7 @@ static struct bperf_sbuffer_node* bperf_sbuffer_node_new(void)
 /**
  * @brief Free memory for an allocated buffer node
  */
-static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node)
-{
+static void bperf_sbuffer_node_free(struct bperf_sbuffer_node *node) {
     list_del(&node->list);
     kfree(node);
 }
@@ -515,8 +506,7 @@ static struct bperf_sbuffer {
 /**
  * @brief Initialize buffer
  */
-static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer)
-{
+static int bperf_sbuffer_init(struct bperf_sbuffer *sbuffer) {
     struct bperf_sbuffer_node *first_node;
     INIT_LIST_HEAD(&sbuffer->list);
     if (!(first_node = bperf_sbuffer_node_new())) {
@@ -549,8 +539,7 @@ static void bperf_sbuffer_clear(struct bperf_sbuffer *sbuffer) {
 /**
  * @brief Free memory for buffer
  */
-static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
-{
+static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer) {
     struct list_head *next, *node;
     mutex_lock_interruptible(&sbuffer->mutex);
     node = sbuffer->list.next;
@@ -566,8 +555,7 @@ static void bperf_sbuffer_fini(struct bperf_sbuffer *sbuffer)
 /**
  * @brief Write len bytes of data to the end of the buffer
  */
-static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, size_t len)
-{
+static ssize_t bperf_sbuffer_write(struct bperf_sbuffer *sbuffer, char *src, size_t len) {
     struct bperf_sbuffer_node *last_node, *new_node;
     ssize_t space_left, amt_to_write, ret = 0;
     if (len == 0) {
@@ -616,8 +604,7 @@ out:
 /**
  * @brief Read upto len bytes of data from the buffer into the destination (user-space)
  */
-static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *dest, size_t len, bool blocking)
-{
+static ssize_t bperf_sbuffer_read(struct bperf_sbuffer *sbuffer, char __user *dest, size_t len, bool blocking) {
     ssize_t amt_data_in_node, amt_to_write, ret = 0;
     struct list_head *ll_node;
     struct bperf_sbuffer_node *node;
@@ -690,8 +677,7 @@ static int SNPRINTF_WRITTEN = 0;
 /**
  * @brief Write formatted data to static staging buffer
  */
-static void bperf_snprintf(const char *fmt, ...)
-{
+static void bperf_snprintf(const char *fmt, ...) {
     va_list args;
     int ret = 0;
     while (true) {
@@ -715,8 +701,7 @@ static void bperf_snprintf(const char *fmt, ...)
 /**
  * @brief Flush staged string to buffer
  */
-static void bperf_snprintf_flush(void)
-{
+static void bperf_snprintf_flush(void) {
     int ret;
     while (SNPRINTF_WRITTEN > 0) {
         ret = bperf_sbuffer_write(&SBUFFER, SNPRINTF_BUFFER, SNPRINTF_WRITTEN);
@@ -756,8 +741,7 @@ static struct bperf_dbuffer {
 /**
  * @brief Initialize buffer
  */
-static int bperf_dbuffer_init(struct bperf_dbuffer *db, size_t nthreads)
-{
+static int bperf_dbuffer_init(struct bperf_dbuffer *db, size_t nthreads) {
     db->data = kvmalloc(nthreads * sizeof(struct bperf_dbuffer_thread), GFP_KERNEL);
     if (!db->data || IS_ERR(db->data)) {
         printk(KERN_ALERT "bperf: Failed to initialize data buffer: kvmalloc failed\n");
@@ -778,8 +762,7 @@ static int bperf_dbuffer_init(struct bperf_dbuffer *db, size_t nthreads)
 /**
  * @brief Free memory for buffer
  */
-static void bperf_dbuffer_fini(struct bperf_dbuffer *dbuffer)
-{
+static void bperf_dbuffer_fini(struct bperf_dbuffer *dbuffer) {
     kvfree(dbuffer->data);
     kvfree(dbuffer->checked_in);
 }
@@ -787,8 +770,7 @@ static void bperf_dbuffer_fini(struct bperf_dbuffer *dbuffer)
 /**
  * @brief Write measured data to string buffer
  */
-static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread_id)
-{
+static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread_id) {
     size_t i, j;
     uint64_t timestamp = dbuffer->data[thread_id].timestamp;
 
@@ -827,8 +809,7 @@ static void bperf_dbuffer_to_string(struct bperf_dbuffer *dbuffer, size_t thread
 /**
  * @brief Notify that thread has finished writing data, and block if required
  */
-static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t thread_id)
-{
+static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t thread_id) {
     if (thread_id >= dbuffer->num_threads) {
         printk(KERN_ALERT "bperf: Invalid thread id: %lu: max: %lu\n", thread_id, dbuffer->num_threads);
         return;
@@ -861,16 +842,14 @@ static void bperf_dbuffer_thread_checkin(struct bperf_dbuffer *dbuffer, size_t t
 /**
  * @brief Dummy llseek function. Basically we don't support seeking
  */
-static loff_t bperf_llseek(struct file *filp, loff_t off, int whence)
-{
+static loff_t bperf_llseek(struct file *filp, loff_t off, int whence) {
     return -ESPIPE; /* unseekable */
 }
 
 /**
  * @brief Open the device and maintain a count of how many times it has been opened
  */
-static int bperf_open(struct inode *inode, struct file *filp)
-{
+static int bperf_open(struct inode *inode, struct file *filp) {
     printk(KERN_INFO "bperf: Device file opened\n");
     return 0;
 }
@@ -878,8 +857,7 @@ static int bperf_open(struct inode *inode, struct file *filp)
 /**
  * @brief Decrement count of number of instances of the file being opened
  */
-static int bperf_release(struct inode *inode, struct file *filp)
-{
+static int bperf_release(struct inode *inode, struct file *filp) {
     printk(KERN_INFO "bperf: Device file closed\n");
     return 0;
 }
@@ -887,8 +865,7 @@ static int bperf_release(struct inode *inode, struct file *filp)
 /**
  * @brief Read the file
  */
-static ssize_t bperf_read(struct file *filp, char __user *buffer, size_t size, loff_t *f_pos)
-{
+static ssize_t bperf_read(struct file *filp, char __user *buffer, size_t size, loff_t *f_pos) {
     ssize_t ret = bperf_sbuffer_read(&SBUFFER, buffer, size, (filp->f_flags & O_NONBLOCK) == 0);
     if (ret > 0) {
         *f_pos += ret;
@@ -910,8 +887,7 @@ static struct file_operations bperf_fops = {
 /**
  * @brief Identify processor
  */
-static void bperf_identify_processor(void)
-{
+static void bperf_identify_processor(void) {
     uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0, stepping, ext_model;
     bperf_cpuid(&eax, &ebx, &ecx, &edx);
     stepping = eax & 0xf;
@@ -930,8 +906,7 @@ static void bperf_identify_processor(void)
 /**
  * @brief Get architectural performance monitoring capabilities
  */
-static void bperf_get_arch_perfmon_capabilities(void)
-{
+static void bperf_get_arch_perfmon_capabilities(void) {
     uint32_t eax = 0x0a, ebx = 0, ecx = 0, edx = 0, bvsz;
     bperf_cpuid(&eax, &ebx, &ecx, &edx);
 
@@ -969,16 +944,14 @@ static void bperf_get_arch_perfmon_capabilities(void)
 /**
  * @brief Fill default values for module state
  */
-static void bperf_fill_state_defaults(void)
-{
+static void bperf_fill_state_defaults(void) {
     STATE.sample_interval = BPERF_DEFAULT_INTERVAL;
 }
 
 /**
  * @brief Setup or disable counting on a single PMC for a single thread
  */
-static bool bperf_thread_setup_pmc(size_t thread_id, size_t pmc_id)
-{
+static bool bperf_thread_setup_pmc(size_t thread_id, size_t pmc_id) {
     uint64_t val;
     struct bperf_dbuffer_thread *thread_state;
     const struct bperf_event *ev;
@@ -1004,8 +977,7 @@ static bool bperf_thread_setup_pmc(size_t thread_id, size_t pmc_id)
 /**
  * @brief Thread function for polling counters
  */
-static int bperf_thread_function(void *arg_thread_id)
-{
+static int bperf_thread_function(void *arg_thread_id) {
     uint32_t i;
     uint64_t r, w, ctrl;
     size_t thread_id;
@@ -1101,8 +1073,7 @@ static int bperf_thread_function(void *arg_thread_id)
 /**
  * @brief The kernel module initialization function
  */
-static int __init bperf_init(void)
-{
+static int __init bperf_init(void) {
     int ret;
     size_t i, j;
 
@@ -1276,8 +1247,7 @@ error_major_number:
 /**
  * @brief The kernel module cleanup function
  */
-static void __exit bperf_exit(void)
-{
+static void __exit bperf_exit(void) {
     size_t i;
     printk(KERN_INFO "bperf: Unloading...\n");
 
