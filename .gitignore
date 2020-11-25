@@ -9,4 +9,3 @@ bperf
 .clangd
 *.qcow2
 *.json
-*.txt

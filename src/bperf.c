@@ -28,7 +28,7 @@
 #include "arch_def_macro.h"
 
 #define BPERF_NAME             "bperf"
-#define BPERF_LICENSE          "GPL"
+#define BPERF_LICENSE          "MIT"
 #define BPERF_AUTHOR           "Srimanta Barua <srimanta.barua1@gmail.com>"
 #define BPERF_DESC             "Kernel module for high frequency counter sampling on x86_64 systems"
 #define BPERF_VERSION          "0.1"
