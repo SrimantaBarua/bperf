@@ -1,9 +1,18 @@
-/**
- * @file    bperf.c
- * @author  Srimanta Barua <srimanta.barua1@gmail.com>
- * @date    27 September 2020
- * @version 0.1
- * @brief   A kernel module for high frequency counter sampling on x86_64 systems
+/*
+ * Copyright (C) 2020 Srimanta Barua <srimanta.barua1@gmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include <stdarg.h>
@@ -28,7 +37,7 @@
 #include "arch_def_macro.h"
 
 #define BPERF_NAME             "bperf"
-#define BPERF_LICENSE          "MIT"
+#define BPERF_LICENSE          "GPL"
 #define BPERF_AUTHOR           "Srimanta Barua <srimanta.barua1@gmail.com>"
 #define BPERF_DESC             "Kernel module for high frequency counter sampling on x86_64 systems"
 #define BPERF_VERSION          "0.1"
